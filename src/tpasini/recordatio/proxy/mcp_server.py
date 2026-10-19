@@ -29,7 +29,6 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict
 
-from tpasini.recordatio import compat
 from tpasini.recordatio.entity import Entity
 from tpasini.recordatio.extraction.extractor import ConversationTurn, ExtractionResult
 from tpasini.recordatio.models import KnowledgeUnit, RenderedRelation
@@ -70,7 +69,7 @@ def _source_agent_id_from(ctx: Context, agent_id: str) -> str:
     request = ctx.request_context.request
     if request is None:
         raise ValueError("MCP tool invoked without an HTTP request context")
-    return compat.header(request.headers, "source-agent-id") or agent_id
+    return request.headers.get("x-recordatio-source-agent-id") or agent_id
 
 
 def create_mcp(
@@ -133,7 +132,7 @@ def create_mcp(
         agent_id = _agent_id_from(ctx)
         source_agent_id = _source_agent_id_from(ctx, agent_id)
         headers = ctx.request_context.request.headers
-        api_key = compat.header(headers, "api-key") or settings.recordatio_extraction_api_key
+        api_key = headers.get("x-recordatio-api-key") or settings.recordatio_extraction_api_key
         user_id = headers.get("x-user-id")
         turn = ConversationTurn(messages=messages, response_text=response_text)
 
