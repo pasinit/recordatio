@@ -30,7 +30,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pontifex import Pontifex
 
-from tpasini.recordatio import compat, identity
+from tpasini.recordatio import identity
 from tpasini.recordatio.agents import (
     AgentConfigStore,
     AgentRunner,
@@ -364,14 +364,14 @@ async def chat_completions(request: Request) -> Response:
             {"error": f"agent slug {identity.RESERVED_USER_SLUG!r} is reserved for the user-level store"},
             status_code=400,
         )
-    source_agent_id: str | None = compat.header(request.headers, "source-agent-id", "").strip() or agent_id
+    source_agent_id: str | None = request.headers.get("x-recordatio-source-agent-id", "").strip() or agent_id
     user_id: str | None = request.headers.get("x-user-id", "").strip() or None
 
     # Recordatio-only fields — strip before routing upstream.
-    extract_hint: dict | None = compat.pop_flag(body, "extract-from")
-    no_briefing: bool = bool(compat.pop_flag(body, "no-briefing", False))
-    skip_input_extraction: bool = bool(compat.pop_flag(body, "skip-input-extraction", False))
-    skip_output_extraction: bool = bool(compat.pop_flag(body, "skip-output-extraction", False))
+    extract_hint: dict | None = body.pop("x-recordatio-extract-from", None)
+    no_briefing: bool = bool(body.pop("x-recordatio-no-briefing", False))
+    skip_input_extraction: bool = bool(body.pop("x-recordatio-skip-input-extraction", False))
+    skip_output_extraction: bool = bool(body.pop("x-recordatio-skip-output-extraction", False))
 
     upstream_api_key = _api_key_from_request(request)
     # Extraction key: use the dedicated setting, or fall back to the upstream
