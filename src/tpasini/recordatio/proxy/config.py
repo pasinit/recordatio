@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     # JSON array override for deployments using another trusted hostname.
     recordatio_mcp_allowed_hosts: list[str] = ["127.0.0.1:*", "localhost:*", "[::1]:*", "recordatio:8787"]
 
+    # Read-only remote access (proxy/network_guard.py). JSON arrays. Callers from
+    # these CIDRs must present a recall key; a recall key (stored as its SHA-256
+    # hex digest) may only call GET /v1/users/{user_id}/memory-search.
+    recordatio_restricted_networks: list[str] = []
+    recordatio_recall_key_sha256: list[str] = []
+
     # Storage
     agentmem_db: str = str(Path.home() / ".agentmem" / "memories.db")
 
