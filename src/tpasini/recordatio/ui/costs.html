@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>agentmem — costs</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f1117; --surface: #1a1d27; --border: #2e3245;
+      --accent: #7c6aff; --accent-dim: #3d3478;
+      --text: #e2e4f0; --text-muted: #7880a0;
+      --success: #5eead4; --danger: #ff6b6b; --warn: #fb923c;
+      --font: "Inter", system-ui, sans-serif;
+      --mono: "JetBrains Mono", "Fira Code", monospace;
+    }
+    body { font-family: var(--font); background: var(--bg); color: var(--text); min-height: 100dvh; }
+
+    header {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 20px; border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    header h1 { font-size: 1rem; font-weight: 600; letter-spacing: -0.02em; }
+    .badge {
+      font-size: 0.65rem; font-weight: 600; padding: 2px 7px;
+      border-radius: 99px; background: var(--accent-dim); color: var(--accent);
+      text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    nav { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+    nav a, nav button {
+      font-size: 0.75rem; padding: 4px 10px; border-radius: 4px;
+      color: var(--text-muted); background: transparent; border: 1px solid var(--border);
+      text-decoration: none; cursor: pointer; font-family: inherit;
+    }
+    nav a:hover, nav button:hover { color: var(--text); border-color: var(--accent-dim); }
+    nav button.active { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-dim); }
+
+    main { max-width: 1100px; margin: 0 auto; padding: 24px 20px; }
+
+    .totals {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px; margin-bottom: 24px;
+    }
+    .stat {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 6px; padding: 14px 16px;
+    }
+    .stat-label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat-value { font-size: 1.4rem; font-weight: 600; margin-top: 4px; font-family: var(--mono); }
+    .stat-sub { font-size: 0.7rem; color: var(--text-muted); margin-top: 4px; font-family: var(--mono); }
+
+    .section { margin-bottom: 24px; }
+    .section h2 {
+      font-size: 0.8rem; font-weight: 600; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px;
+    }
+
+    table {
+      width: 100%; border-collapse: collapse;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+      overflow: hidden; font-size: 0.85rem;
+    }
+    th, td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--border); }
+    tr:last-child td { border-bottom: none; }
+    th { font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); background: rgba(0,0,0,0.2); }
+    th.num, td.num { text-align: right; }
+    td.num { font-family: var(--mono); }
+    td.muted { color: var(--text-muted); font-size: 0.75rem; }
+    .empty { padding: 24px; text-align: center; color: var(--text-muted); font-size: 0.85rem; }
+
+    .err { color: var(--danger); font-family: var(--mono); font-size: 0.85rem; padding: 12px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>agentmem</h1>
+  <span class="badge">costs</span>
+  <nav>
+    <button data-range="24h">24h</button>
+    <button data-range="7d" class="active">7d</button>
+    <button data-range="30d">30d</button>
+    <button data-range="all">all</button>
+    <a href="memories">memories →</a>
+    <a href="feedback">feedback →</a>
+  </nav>
+</header>
+
+<main>
+  <div id="totals" class="totals"></div>
+
+  <div class="section">
+    <h2>By kind</h2>
+    <div id="by-kind"></div>
+  </div>
+
+  <div class="section">
+    <h2>By agent</h2>
+    <div id="by-agent"></div>
+  </div>
+
+  <div class="section">
+    <h2>By model</h2>
+    <div id="by-model"></div>
+  </div>
+</main>
+
+<script>
+(function () {
+  const fmtUsd = (n) => "$" + (Number(n) || 0).toFixed(4);
+  const fmtNum = (n) => (Number(n) || 0).toLocaleString();
+
+  let currentRange = "7d";
+
+  function renderTotals(t) {
+    const el = document.getElementById("totals");
+    el.innerHTML = `
+      <div class="stat">
+        <div class="stat-label">Total spend</div>
+        <div class="stat-value">${fmtUsd(t.cost_usd)}</div>
+        <div class="stat-sub">${fmtNum(t.event_count)} calls</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Input tokens</div>
+        <div class="stat-value">${fmtNum(t.input_tokens)}</div>
+        <div class="stat-sub">${fmtNum(t.cache_read_tokens)} cached</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Output tokens</div>
+        <div class="stat-value">${fmtNum(t.output_tokens)}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Cache writes</div>
+        <div class="stat-value">${fmtNum(t.cache_creation_tokens)}</div>
+      </div>
+    `;
+  }
+
+  function renderTable(elId, rows, columns) {
+    const el = document.getElementById(elId);
+    if (!rows || !rows.length) {
+      el.innerHTML = `<div class="empty">No data in this range.</div>`;
+      return;
+    }
+    const head = columns.map(c => {
+      const cls = c.numeric ? "num" : "";
+      return `<th class="${cls}">${c.label}</th>`;
+    }).join("");
+    const body = rows.map(r => {
+      return "<tr>" + columns.map(c => {
+        const v = c.value(r);
+        const cls = c.numeric ? "num" : (c.muted ? "muted" : "");
+        return `<td class="${cls}">${v}</td>`;
+      }).join("") + "</tr>";
+    }).join("");
+    el.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  }
+
+  async function load() {
+    try {
+      const r = await fetch(`costs/data?range=${currentRange}`);
+      if (!r.ok) {
+        document.getElementById("totals").innerHTML = `<div class="err">load failed: ${r.status}</div>`;
+        return;
+      }
+      const data = await r.json();
+      renderTotals(data.totals || {});
+      renderTable("by-kind", data.by_kind, [
+        { label: "Kind",   value: r => r.key || "—" },
+        { label: "Cost",   value: r => fmtUsd(r.cost_usd), numeric: true },
+        { label: "Calls",  value: r => fmtNum(r.event_count), numeric: true },
+        { label: "In tok", value: r => fmtNum(r.input_tokens), numeric: true },
+        { label: "Out tok", value: r => fmtNum(r.output_tokens), numeric: true },
+      ]);
+      renderTable("by-agent", data.by_agent, [
+        { label: "Agent",  value: r => r.key || "(none)" },
+        { label: "Top model", value: r => r.top_child || "—", muted: true },
+        { label: "Cost",   value: r => fmtUsd(r.cost_usd), numeric: true },
+        { label: "Calls",  value: r => fmtNum(r.event_count), numeric: true },
+      ]);
+      renderTable("by-model", data.by_model, [
+        { label: "Model",  value: r => r.key || "(none)" },
+        { label: "Cost",   value: r => fmtUsd(r.cost_usd), numeric: true },
+        { label: "Calls",  value: r => fmtNum(r.event_count), numeric: true },
+        { label: "In tok", value: r => fmtNum(r.input_tokens), numeric: true },
+        { label: "Out tok", value: r => fmtNum(r.output_tokens), numeric: true },
+      ]);
+    } catch (e) {
+      document.getElementById("totals").innerHTML = `<div class="err">${e.message}</div>`;
+    }
+  }
+
+  document.querySelectorAll("nav button[data-range]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("nav button[data-range]").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      currentRange = btn.dataset.range;
+      load();
+    });
+  });
+
+  load();
+})();
+</script>
+
+</body>
+</html>

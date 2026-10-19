@@ -1,0 +1,1425 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>agentmem - memory inspector</title>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      --bg: #0d1014;
+      --panel: #151a20;
+      --panel-2: #10151b;
+      --line: #26313b;
+      --line-soft: #1c252e;
+      --text: #edf1f4;
+      --muted: #91a0ad;
+      --faint: #60707e;
+      --entity: #71b7ff;
+      --attribute: #f5c76b;
+      --mention: #8fe388;
+      --topic: #e68bff;
+      --semantic: #51d6c3;
+      --episodic: #a998ff;
+      --procedural: #ff9b6a;
+      --danger: #ff736e;
+      --font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+    body {
+      margin: 0;
+      height: 100dvh;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      letter-spacing: 0;
+    }
+    .shell {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 390px;
+      grid-template-rows: auto minmax(0, 1fr);
+      height: 100dvh;
+    }
+    header {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #11161c;
+      min-width: 0;
+    }
+    h1 { margin: 0; font-size: 16px; font-weight: 680; }
+    .mode {
+      color: var(--muted);
+      font-size: 12px;
+      border: 1px solid var(--line);
+      padding: 3px 7px;
+      border-radius: 6px;
+    }
+    .graph-controls {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .graph-mode {
+      display: grid;
+      grid-template-columns: repeat(4, max-content);
+      flex: 0 0 auto;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    .graph-mode button {
+      height: 30px;
+      min-width: 68px;
+      padding: 0 10px;
+      border: 0;
+      border-right: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      font: 12px var(--font);
+      white-space: nowrap;
+      cursor: pointer;
+    }
+    .graph-mode button:last-child { border-right: 0; }
+    .graph-mode button:hover,
+    .graph-mode button:focus-visible {
+      color: var(--text);
+      outline: none;
+    }
+    .graph-mode button.active {
+      color: var(--bg);
+      background: var(--entity);
+    }
+    .graph-select {
+      height: 30px;
+      max-width: 108px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--bg);
+      color: var(--text);
+      padding: 0 8px;
+      font: 12px var(--font);
+      outline: none;
+    }
+    .graph-layout { max-width: 112px; }
+    .graph-count {
+      color: var(--muted);
+      font: 11px var(--mono);
+      white-space: nowrap;
+    }
+    .search {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 240px;
+    }
+    .search input {
+      width: 100%;
+      height: 30px;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 10px;
+      font: 13px var(--font);
+      outline: none;
+    }
+    .search input:focus { border-color: var(--entity); }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(72px, auto));
+      gap: 1px;
+      border: 1px solid var(--line);
+      background: var(--line);
+      border-radius: 7px;
+      overflow: hidden;
+    }
+    .stat {
+      min-width: 72px;
+      padding: 5px 8px;
+      background: var(--panel);
+    }
+    .stat strong { display: block; font-size: 13px; line-height: 1; }
+    .stat span { display: block; margin-top: 3px; font-size: 10px; color: var(--muted); text-transform: uppercase; }
+    main {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      background:
+        linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+      background-size: 28px 28px;
+    }
+    #graph-svg { width: 100%; height: 100%; display: block; }
+    aside {
+      min-height: 0;
+      overflow: auto;
+      border-left: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .section { border-bottom: 1px solid var(--line); }
+    .section h2 {
+      margin: 0;
+      padding: 11px 14px;
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      background: var(--panel-2);
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    .rows { padding: 8px 10px 12px; display: grid; gap: 7px; }
+    .row {
+      border: 1px solid var(--line-soft);
+      border-radius: 7px;
+      padding: 8px;
+      background: #121820;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .row:hover { border-color: #40505d; }
+    .row-title {
+      display: flex;
+      gap: 8px;
+      justify-content: space-between;
+      align-items: baseline;
+      min-width: 0;
+      font-weight: 650;
+    }
+    .row-title span:first-child {
+      overflow-wrap: anywhere;
+    }
+    .pill {
+      flex-shrink: 0;
+      color: var(--bg);
+      background: var(--muted);
+      border-radius: 999px;
+      padding: 2px 6px;
+      font: 10px var(--mono);
+    }
+    .pill.attribute { background: var(--attribute); }
+    .pill.mention { background: var(--mention); }
+    .pill.entity { background: var(--entity); }
+    .pill.schema { background: var(--topic); }
+    .muted { color: var(--muted); }
+    .mono { font-family: var(--mono); }
+    .value {
+      margin-top: 5px;
+      color: #d9e0e6;
+      overflow-wrap: anywhere;
+    }
+    .details {
+      margin: 8px 0 0;
+      display: grid;
+      gap: 4px;
+    }
+    .detail {
+      display: grid;
+      grid-template-columns: 74px minmax(0, 1fr);
+      gap: 8px;
+      min-width: 0;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .detail dt {
+      margin: 0;
+      color: var(--faint);
+      text-transform: uppercase;
+      font-size: 9px;
+    }
+    .detail dd {
+      margin: 0;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+    .empty {
+      color: var(--faint);
+      padding: 14px;
+      font-size: 13px;
+    }
+    .dashboard-mode .shell { grid-template-columns: minmax(0, 1fr); }
+    .dashboard-mode aside { display: none; }
+    .dashboard-mode .graph-controls { display: none !important; }
+    .dashboard-mode main {
+      overflow: auto;
+      background: #0d1014;
+    }
+    .dashboard-mode #graph-svg,
+    .dashboard-mode .legend,
+    .dashboard-mode #empty { display: none !important; }
+    .agent-dashboard {
+      display: none;
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 20px 18px 34px;
+    }
+    .dashboard-mode .agent-dashboard {
+      display: grid;
+      gap: 14px;
+    }
+    .user-group {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--panel);
+    }
+    .user-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      background: var(--panel-2);
+      border-bottom: 1px solid var(--line);
+    }
+    .user-head strong {
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+    .user-head span {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    .agent-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 1px;
+      background: var(--line-soft);
+    }
+    .agent-card {
+      display: grid;
+      gap: 9px;
+      min-height: 128px;
+      padding: 12px;
+      color: var(--text);
+      background: #121820;
+      text-decoration: none;
+      border: 1px solid transparent;
+    }
+    .agent-card:hover,
+    .agent-card:focus-visible {
+      border-color: var(--entity);
+      outline: none;
+      background: #151d26;
+    }
+    .agent-title {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+    }
+    .agent-title strong {
+      font-size: 15px;
+      overflow-wrap: anywhere;
+    }
+    .agent-id {
+      color: var(--muted);
+      font: 11px var(--mono);
+      overflow-wrap: anywhere;
+    }
+    .agent-counts {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+    }
+    .agent-count {
+      min-width: 0;
+      padding: 6px;
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      background: var(--bg);
+    }
+    .agent-count strong {
+      display: block;
+      font-size: 13px;
+      line-height: 1;
+    }
+    .agent-count span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+    }
+    .agent-meta {
+      color: var(--muted);
+      font: 11px var(--mono);
+      min-height: 15px;
+      overflow-wrap: anywhere;
+    }
+    .legend {
+      position: absolute;
+      left: 14px;
+      bottom: 14px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      max-width: calc(100% - 28px);
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(13, 16, 20, 0.88);
+      backdrop-filter: blur(8px);
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .dot { width: 9px; height: 9px; border-radius: 50%; border: 1px solid currentColor; background: currentColor; }
+    .entity-color { color: var(--entity); }
+    .attribute-color { color: var(--attribute); }
+    .mention-color { color: var(--mention); }
+    .topic-color { color: var(--topic); }
+    .semantic-color { color: var(--semantic); }
+    .episodic-color { color: var(--episodic); }
+    .procedural-color { color: var(--procedural); }
+    .gnode circle, .gnode polygon {
+      stroke-width: 1.8px;
+      cursor: pointer;
+      transition: opacity 0.15s, stroke-width 0.15s;
+    }
+    .gnode text {
+      fill: var(--text);
+      font-size: 10px;
+      text-anchor: middle;
+      pointer-events: none;
+      paint-order: stroke;
+      stroke: var(--bg);
+      stroke-width: 3px;
+    }
+    .gnode.entity circle { fill: #102238; stroke: var(--entity); }
+    .gnode.attribute circle { fill: #2e2511; stroke: var(--attribute); }
+    .gnode.semantic circle { fill: #0e2d2a; stroke: var(--semantic); }
+    .gnode.episodic circle { fill: #211d35; stroke: var(--episodic); }
+    .gnode.procedural circle { fill: #2f1d12; stroke: var(--procedural); }
+    .gnode.topic polygon { fill: #2a1233; stroke: var(--topic); }
+    .gnode.selected circle, .gnode.selected polygon { stroke-width: 3px; }
+    .dimmed { opacity: 0.13; }
+    .gedge line { stroke: #40505d; stroke-width: 1px; }
+    .gedge.attribute line { stroke: var(--attribute); stroke-opacity: 0.55; }
+    .gedge.mention line { stroke: var(--mention); stroke-opacity: 0.45; stroke-dasharray: 3 4; }
+    .gedge.topic line { stroke: var(--topic); stroke-opacity: 0.45; }
+    .gedge text { fill: var(--muted); font-size: 9px; paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
+    #tooltip {
+      position: absolute;
+      display: none;
+      max-width: 320px;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(17, 22, 28, 0.94);
+      box-shadow: 0 10px 28px rgba(0,0,0,0.32);
+      pointer-events: none;
+      font-size: 12px;
+      line-height: 1.4;
+      z-index: 10;
+    }
+    #empty {
+      position: absolute;
+      inset: 0;
+      display: none;
+      place-items: center;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    @media (max-width: 900px) {
+      .shell { grid-template-columns: 1fr; grid-template-rows: auto minmax(48dvh, 1fr) minmax(0, 42dvh); }
+      aside { border-left: 0; border-top: 1px solid var(--line); }
+      header { flex-wrap: wrap; }
+      .graph-controls { order: 2; width: 100%; flex-wrap: wrap; }
+      .search { order: 3; margin-left: 0; width: 100%; }
+      .stats { grid-template-columns: repeat(3, 1fr); width: 100%; }
+    }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <h1>agentmem</h1>
+    <span class="mode">structured memory inspector</span>
+    <div class="graph-controls" id="graph-controls">
+      <div class="graph-mode" id="graph-mode">
+        <button type="button" data-view="map" class="active">Overview</button>
+        <button type="button" data-view="facts">Facts</button>
+        <button type="button" data-view="evidence">Evidence</button>
+        <button type="button" data-view="full">Full</button>
+      </div>
+      <select class="graph-limit graph-select" id="graph-limit" aria-label="Graph node limit">
+        <option value="80" selected>80 nodes</option>
+        <option value="160">160 nodes</option>
+        <option value="320">320 nodes</option>
+        <option value="all">All nodes</option>
+      </select>
+      <select class="graph-layout graph-select" id="graph-layout" aria-label="Graph layout">
+        <option value="auto" selected>Auto</option>
+        <option value="spread">Spread</option>
+        <option value="radial">Radial</option>
+        <option value="lanes">Lanes</option>
+      </select>
+      <span class="graph-count" id="graph-count"></span>
+    </div>
+    <div class="stats" id="stats"></div>
+    <label class="search">
+      <input id="search" type="search" placeholder="Filter graph and rows" autocomplete="off" />
+    </label>
+  </header>
+
+  <main>
+    <div id="agent-dashboard" class="agent-dashboard"></div>
+    <svg id="graph-svg"></svg>
+    <div id="tooltip"></div>
+    <div id="empty">No memories for this agent.</div>
+    <div class="legend">
+      <div class="legend-item entity-color"><span class="dot"></span>entity</div>
+      <div class="legend-item attribute-color"><span class="dot"></span>attribute</div>
+      <div class="legend-item mention-color"><span class="dot"></span>mention</div>
+      <div class="legend-item semantic-color"><span class="dot"></span>semantic</div>
+      <div class="legend-item episodic-color"><span class="dot"></span>episodic</div>
+      <div class="legend-item procedural-color"><span class="dot"></span>procedural</div>
+      <div class="legend-item topic-color"><span class="dot"></span>topic</div>
+    </div>
+  </main>
+
+  <aside>
+    <section class="section">
+      <h2>Selected</h2>
+      <div class="rows" id="selected"><div class="empty">Click a graph node to inspect its structured fields.</div></div>
+    </section>
+    <section class="section">
+      <h2>Selected Attributes</h2>
+      <div class="rows" id="attributes"></div>
+    </section>
+    <section class="section">
+      <h2>Selected Mention Evidence</h2>
+      <div class="rows" id="mentions"></div>
+    </section>
+    <section class="section">
+      <h2>Selected Aliases & Identifiers</h2>
+      <div class="rows" id="identity"></div>
+    </section>
+    <section class="section">
+      <h2>Selected Schema</h2>
+      <div class="rows" id="schema"></div>
+    </section>
+  </aside>
+</div>
+
+<script>
+  const state = {
+    data: null,
+    agents: null,
+    nodeG: null,
+    edgeG: null,
+    neighbours: null,
+    sim: null,
+    selectedId: null,
+    view: "graph",
+    graphView: "map",
+    graphLayout: "auto",
+    nodeLimit: 80,
+  };
+  const graphSvg = document.getElementById("graph-svg");
+  const statsEl = document.getElementById("stats");
+  const emptyEl = document.getElementById("empty");
+  const tooltip = document.getElementById("tooltip");
+  const searchEl = document.getElementById("search");
+  const dashboardEl = document.getElementById("agent-dashboard");
+  const modeEl = document.querySelector(".mode");
+  const graphControlsEl = document.getElementById("graph-controls");
+  const graphModeEl = document.getElementById("graph-mode");
+  const graphLimitEl = document.getElementById("graph-limit");
+  const graphLayoutEl = document.getElementById("graph-layout");
+  const graphCountEl = document.getElementById("graph-count");
+
+  searchEl.addEventListener("input", () => {
+    if (state.view === "agents") {
+      renderAgentDashboard();
+    } else {
+      renderLists();
+    }
+  });
+  graphModeEl.addEventListener("click", event => {
+    const button = event.target.closest("button[data-view]");
+    if (!button) return;
+    state.graphView = button.dataset.view;
+    graphModeEl.querySelectorAll("button").forEach(item => {
+      item.classList.toggle("active", item.dataset.view === state.graphView);
+    });
+    drawCurrentGraph();
+  });
+  graphLimitEl.addEventListener("change", () => {
+    state.nodeLimit = graphLimitEl.value === "all" ? "all" : Number(graphLimitEl.value);
+    drawCurrentGraph();
+  });
+  graphLayoutEl.addEventListener("change", () => {
+    state.graphLayout = graphLayoutEl.value;
+    drawCurrentGraph();
+  });
+
+  function esc(value) {
+    return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function trunc(value, n = 130) {
+    const text = String(value ?? "");
+    return text.length > n ? text.slice(0, n - 1) + "..." : text;
+  }
+
+  function matches(row, query) {
+    if (!query) return true;
+    return JSON.stringify(row).toLowerCase().includes(query);
+  }
+
+  function detailRows(details) {
+    const items = details.filter(item => item?.value);
+    if (!items.length) return "";
+    return `<dl class="details">${items.map(item => `
+      <div class="detail">
+        <dt>${esc(item.label)}</dt>
+        <dd>${esc(item.value)}</dd>
+      </div>
+    `).join("")}</dl>`;
+  }
+
+  function row(title, pill, value, meta = "", details = []) {
+    return `
+      <div class="row">
+        <div class="row-title"><span>${esc(title)}</span>${pill ? `<span class="pill ${esc(pill.kind || "")}">${esc(pill.text)}</span>` : ""}</div>
+        ${value ? `<div class="value">${esc(value)}</div>` : ""}
+        ${meta ? `<div class="muted mono">${esc(meta)}</div>` : ""}
+        ${detailRows(details)}
+      </div>`;
+  }
+
+  function sourceKindLabel(kind) {
+    const labels = {
+      knowledge_unit: "memory unit",
+      extraction_candidate: "extraction candidate",
+      entity: "entity",
+      relation: "relation",
+      attribute: "attribute",
+    };
+    return labels[kind] || String(kind || "source").replace(/_/g, " ");
+  }
+
+  function evidenceMentionDetails(item) {
+    return [
+      { label: "entity", value: item.entity_label },
+      { label: "entity id", value: item.entity_id },
+      { label: "matched text", value: item.snippet },
+      { label: "mention id", value: item.id },
+      { label: "source id", value: item.source_id },
+      { label: "source", value: sourceKindLabel(item.source_kind) },
+      { label: "seen", value: formatDate(item.asserted_at) },
+    ];
+  }
+
+  function evidenceMentionRow(item) {
+    const sourceLabel = item.source_label && item.source_label !== item.snippet ? item.source_label : "";
+    const matched = item.snippet && item.snippet !== item.entity_label ? `matched text: ${item.snippet}` : "";
+    return row(
+      `mentioned in ${sourceKindLabel(item.source_kind)}`,
+      { text: item.entity_label || "mention", kind: "mention" },
+      sourceLabel || item.snippet || "",
+      matched,
+      evidenceMentionDetails(item),
+    );
+  }
+
+  function attributeDetails(item) {
+    return [
+      { label: "entity", value: item.entity_label },
+      { label: "entity id", value: item.entity_id },
+      { label: "attribute id", value: item.id },
+      { label: "attribute type", value: item.attribute_type },
+      { label: "asserted", value: formatDate(item.asserted_at) },
+      { label: "valid from", value: formatDate(item.valid_from) },
+      { label: "valid until", value: item.valid_until ? formatDate(item.valid_until) : "" },
+      { label: "provenance", value: item.provenance },
+    ];
+  }
+
+  function attributeRow(item, title = `attribute of ${item.entity_label}`) {
+    const stateLabel = item.active ? "" : "inactive";
+    return row(
+      title,
+      { text: item.attribute_type, kind: "attribute" },
+      item.value,
+      stateLabel,
+      attributeDetails(item),
+    );
+  }
+
+  function renderStats(counts) {
+    const items = [
+      ["entities", counts.entities],
+      ["attributes", counts.attributes],
+      ["mentions", counts.mentions],
+      ["aliases", counts.aliases],
+      ["identifiers", counts.identifiers],
+      ["relations", counts.relations],
+    ];
+    statsEl.innerHTML = items.map(([label, value]) => (
+      `<div class="stat"><strong>${value ?? 0}</strong><span>${label}</span></div>`
+    )).join("");
+  }
+
+  function renderDashboardStats(counts) {
+    const items = [
+      ["agents", counts.agents],
+      ["users", counts.users],
+      ["units", counts.units],
+      ["entities", counts.entities],
+      ["attributes", counts.attributes],
+      ["mentions", counts.mentions],
+    ];
+    statsEl.innerHTML = items.map(([label, value]) => (
+      `<div class="stat"><strong>${value ?? 0}</strong><span>${label}</span></div>`
+    )).join("");
+  }
+
+  function formatDate(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+  }
+
+  function agentMatches(agent, query) {
+    if (!query) return true;
+    return [
+      agent.agent_id,
+      agent.user,
+      agent.name,
+      agent.last_seen,
+      JSON.stringify(agent.counts || {}),
+    ].join(" ").toLowerCase().includes(query);
+  }
+
+  function renderAgentDashboard() {
+    const payload = state.agents;
+    if (!payload) return;
+    const q = searchEl.value.trim().toLowerCase();
+    const agents = (payload.agents || []).filter(agent => agentMatches(agent, q));
+    if (!agents.length) {
+      dashboardEl.innerHTML = `<div class="empty">No matching agents.</div>`;
+      return;
+    }
+
+    const groups = new Map();
+    for (const agent of agents) {
+      const group = groups.get(agent.user) || [];
+      group.push(agent);
+      groups.set(agent.user, group);
+    }
+
+    dashboardEl.innerHTML = [...groups.entries()].map(([user, items]) => `
+      <section class="user-group">
+        <div class="user-head">
+          <strong>${esc(user)}</strong>
+          <span>${items.length} ${items.length === 1 ? "agent" : "agents"}</span>
+        </div>
+        <div class="agent-grid">
+          ${items.map(agent => {
+            const counts = agent.counts || {};
+            return `
+              <a class="agent-card" href="?agent_id=${encodeURIComponent(agent.agent_id)}">
+                <div>
+                  <div class="agent-title">
+                    <strong>${esc(agent.name)}</strong>
+                    <span class="pill entity">open</span>
+                  </div>
+                  <div class="agent-id">${esc(agent.agent_id)}</div>
+                </div>
+                <div class="agent-counts">
+                  ${[
+                    ["units", counts.units],
+                    ["entities", counts.entities],
+                    ["attrs", counts.attributes],
+                    ["rels", counts.relations],
+                    ["mentions", counts.mentions],
+                    ["ids", counts.identifiers],
+                  ].map(([label, value]) => `
+                    <div class="agent-count"><strong>${value ?? 0}</strong><span>${esc(label)}</span></div>
+                  `).join("")}
+                </div>
+                <div class="agent-meta">${esc(formatDate(agent.last_seen))}</div>
+              </a>`;
+          }).join("")}
+        </div>
+      </section>
+    `).join("");
+  }
+
+  function isUnitNode(node) {
+    return ["semantic", "episodic", "procedural"].includes(node.kind);
+  }
+
+  function isAllowedNode(node) {
+    if (state.graphView === "map") return ["entity", "topic"].includes(node.kind);
+    if (state.graphView === "facts") return ["entity", "attribute", "topic"].includes(node.kind);
+    if (state.graphView === "evidence") return node.kind === "entity" || isUnitNode(node);
+    return true;
+  }
+
+  function isAllowedEdge(edge) {
+    if (state.graphView === "map") return ["relation", "topic"].includes(edge.kind || "relation");
+    if (state.graphView === "facts") return ["relation", "attribute", "topic"].includes(edge.kind || "relation");
+    if (state.graphView === "evidence") return edge.kind === "mention";
+    return true;
+  }
+
+  function rankNode(node, degree) {
+    const kindRank = { entity: 5, topic: 4, attribute: 3, episodic: 2, semantic: 2, procedural: 2 };
+    return [degree.get(node.id) || 0, kindRank[node.kind] || 1, node.label || node.id];
+  }
+
+  function compareRankedNodes(a, b, degree) {
+    const left = rankNode(a, degree);
+    const right = rankNode(b, degree);
+    if (left[0] !== right[0]) return right[0] - left[0];
+    if (left[1] !== right[1]) return right[1] - left[1];
+    return String(left[2]).localeCompare(String(right[2]));
+  }
+
+  function visibleGraph(nodes, edges) {
+    const allowedNodes = nodes.filter(isAllowedNode);
+    const allowedIds = new Set(allowedNodes.map(node => node.id));
+    const allowedEdges = edges.filter(edge => (
+      isAllowedEdge(edge) && allowedIds.has(edge.source) && allowedIds.has(edge.target)
+    ));
+    const degree = new Map(allowedNodes.map(node => [node.id, 0]));
+    for (const edge of allowedEdges) {
+      degree.set(edge.source, (degree.get(edge.source) || 0) + 1);
+      degree.set(edge.target, (degree.get(edge.target) || 0) + 1);
+    }
+
+    if (state.nodeLimit === "all" || allowedNodes.length <= state.nodeLimit) {
+      return { nodes: allowedNodes, edges: allowedEdges, totalNodes: allowedNodes.length, totalEdges: allowedEdges.length };
+    }
+
+    const limit = state.nodeLimit;
+    const selected = new Set();
+    const addNode = node => {
+      if (selected.size < limit) selected.add(node.id);
+    };
+    const sorted = [...allowedNodes].sort((a, b) => compareRankedNodes(a, b, degree));
+
+    if (state.graphView === "facts" || state.graphView === "evidence") {
+      const coreLimit = Math.max(24, Math.floor(limit * 0.62));
+      for (const node of sorted.filter(item => item.kind === "entity" || item.kind === "topic")) {
+        if (selected.size >= coreLimit) break;
+        addNode(node);
+      }
+      for (const edge of allowedEdges) {
+        const sourceSelected = selected.has(edge.source);
+        const targetSelected = selected.has(edge.target);
+        if (sourceSelected && allowedIds.has(edge.target)) addNode({ id: edge.target });
+        if (targetSelected && allowedIds.has(edge.source)) addNode({ id: edge.source });
+        if (selected.size >= limit) break;
+      }
+    } else if (state.graphView === "full") {
+      const coreLimit = Math.max(16, Math.floor(limit * 0.46));
+      const unitLimit = Math.max(12, Math.floor(limit * 0.34));
+      for (const node of sorted.filter(item => ["entity", "topic", "attribute"].includes(item.kind))) {
+        if (selected.size >= coreLimit) break;
+        addNode(node);
+      }
+      const unitsByKind = {
+        semantic: sorted.filter(item => item.kind === "semantic"),
+        episodic: sorted.filter(item => item.kind === "episodic"),
+        procedural: sorted.filter(item => item.kind === "procedural"),
+      };
+      while (selected.size < coreLimit + unitLimit) {
+        let added = false;
+        for (const kind of ["semantic", "episodic", "procedural"]) {
+          const next = unitsByKind[kind].shift();
+          if (!next) continue;
+          addNode(next);
+          added = true;
+          if (selected.size >= coreLimit + unitLimit) break;
+        }
+        if (!added) break;
+      }
+      for (const edge of allowedEdges) {
+        const sourceSelected = selected.has(edge.source);
+        const targetSelected = selected.has(edge.target);
+        if (sourceSelected && allowedIds.has(edge.target)) addNode({ id: edge.target });
+        if (targetSelected && allowedIds.has(edge.source)) addNode({ id: edge.source });
+        if (selected.size >= limit) break;
+      }
+    }
+    for (const node of sorted) {
+      if (selected.size >= limit) break;
+      addNode(node);
+    }
+
+    const visibleNodes = allowedNodes.filter(node => selected.has(node.id));
+    const visibleIds = new Set(visibleNodes.map(node => node.id));
+    const visibleEdges = allowedEdges.filter(edge => visibleIds.has(edge.source) && visibleIds.has(edge.target));
+    return { nodes: visibleNodes, edges: visibleEdges, totalNodes: allowedNodes.length, totalEdges: allowedEdges.length };
+  }
+
+  function renderGraphCount(graph) {
+    graphCountEl.textContent = `${graph.nodes.length}/${graph.totalNodes} nodes · ${graph.edges.length}/${graph.totalEdges} edges`;
+  }
+
+  function drawCurrentGraph() {
+    if (!state.data) return;
+    state.selectedId = null;
+    renderSelected(null);
+    const graph = visibleGraph(state.data.nodes || [], state.data.edges || []);
+    renderGraphCount(graph);
+    draw(graph.nodes, graph.edges);
+    applyGraphFilter(searchEl.value.trim().toLowerCase());
+  }
+
+  function renderLists() {
+    const data = state.data;
+    if (!data) return;
+    const q = searchEl.value.trim().toLowerCase();
+    applyGraphFilter(q);
+
+    const attrs = selectedAttributes(data).filter(item => matches(item, q)).slice(0, 80);
+    document.getElementById("attributes").innerHTML = attrs.length
+      ? attrs.map(item => attributeRow(item)).join("")
+      : `<div class="empty">${state.selectedId ? "No attributes for the selected node." : "Select a node to inspect its attributes."}</div>`;
+
+    const mentions = selectedMentions(data).filter(item => matches(item, q)).slice(0, 80);
+    document.getElementById("mentions").innerHTML = mentions.length
+      ? mentions.map(item => evidenceMentionRow(item)).join("")
+      : `<div class="empty">${state.selectedId ? "No mention evidence for the selected node." : "Select a node to inspect its mention evidence."}</div>`;
+
+    const aliases = selectedAliases(data).filter(item => matches(item, q)).slice(0, 40);
+    const identifiers = selectedIdentifiers(data).filter(item => matches(item, q)).slice(0, 40);
+    document.getElementById("identity").innerHTML =
+      (aliases.length || identifiers.length)
+        ? [
+            ...aliases.map(item => row(item.entity_label, { text: "alias", kind: "entity" }, item.alias, item.source)),
+            ...identifiers.map(item => row(item.entity_label, { text: item.namespace, kind: "entity" }, item.value, item.source)),
+          ].join("")
+        : `<div class="empty">${state.selectedId ? "No aliases or identifiers for the selected node." : "Select an entity to inspect its aliases and identifiers."}</div>`;
+
+    const schema = selectedSchema(data).filter(item => matches(item, q)).slice(0, 80);
+    document.getElementById("schema").innerHTML = schema.length
+      ? schema.map(item => schemaRow(item)).join("")
+      : `<div class="empty">${state.selectedId ? "No schema rows for the selected node." : "Select a node to inspect related schema."}</div>`;
+  }
+
+  function selectedAttributes(data) {
+    if (!state.selectedId) return [];
+    return (data.entity_attributes || []).filter(item => (
+      item.entity_id === state.selectedId || `attribute:${item.id}` === state.selectedId
+    ));
+  }
+
+  function selectedMentions(data) {
+    if (!state.selectedId) return [];
+    return (data.entity_mentions || []).filter(item => (
+      item.entity_id === state.selectedId || item.source_id === state.selectedId
+    ));
+  }
+
+  function selectedAliases(data) {
+    if (!state.selectedId) return [];
+    return (data.entity_aliases || []).filter(item => item.entity_id === state.selectedId);
+  }
+
+  function selectedIdentifiers(data) {
+    if (!state.selectedId) return [];
+    return (data.entity_identifiers || []).filter(item => item.entity_id === state.selectedId);
+  }
+
+  function selectedSchema(data) {
+    if (!state.selectedId) return [];
+    const nodesById = new Map((data.nodes || []).map(node => [node.id, node]));
+    const selectedNode = nodesById.get(state.selectedId);
+    const entityTypes = new Map((data.schema?.entity_types || []).map(item => [item.name, item]));
+    const attributeTypes = new Map((data.schema?.attribute_types || []).map(item => [item.name, item]));
+    const relationTypes = new Map((data.schema?.relation_types || []).map(item => [item.name, item]));
+    const rows = [];
+    const seen = new Set();
+    const add = (kind, item, details = []) => {
+      if (!item) return;
+      const key = `${kind}:${item.name}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      rows.push({ ...item, kind, details });
+    };
+
+    if (selectedNode?.kind === "entity") {
+      add("entity type", entityTypes.get(selectedNode.type));
+    }
+    for (const attr of selectedAttributes(data)) {
+      add("attribute type", attributeTypes.get(attr.attribute_type));
+    }
+    for (const edge of data.edges || []) {
+      if ((edge.kind || "relation") !== "relation") continue;
+      if (edge.source !== state.selectedId && edge.target !== state.selectedId) continue;
+      add("relation type", relationTypes.get(edge.label), [
+        { label: "direction", value: edge.source === state.selectedId ? "outgoing" : "incoming" },
+        { label: "edge id", value: edge.id },
+      ]);
+    }
+    return rows;
+  }
+
+  function schemaRow(item) {
+    const details = [
+      { label: "schema id", value: item.id },
+      { label: "source", value: item.source },
+      { label: "value type", value: item.value_type },
+      { label: "functional", value: item.is_functional ? "yes" : "" },
+      ...(item.details || []),
+    ];
+    return row(item.name, { text: item.kind, kind: "schema" }, item.description, "", details);
+  }
+
+  function renderSelected(node) {
+    const data = state.data;
+    if (!data || !node) {
+      document.getElementById("selected").innerHTML = `<div class="empty">Click a graph node to inspect its structured fields.</div>`;
+      return;
+    }
+    const chunks = [
+      row(node.label, { text: node.kind, kind: node.kind }, node.description || node.value || node.canonical_key || "", node.wikidata_id || node.id),
+    ];
+    document.getElementById("selected").innerHTML = chunks.join("");
+  }
+
+  function applyGraphFilter(query) {
+    if (!state.nodeG || !state.edgeG) return;
+    const selectedRelated = selectedFocusIds();
+    const matched = new Set();
+    if (query) {
+      state.nodeG.each(d => {
+        if (JSON.stringify(d).toLowerCase().includes(query)) matched.add(d.id);
+      });
+    }
+    if (!query && !selectedRelated) {
+      state.nodeG.classed("dimmed", false);
+      state.edgeG.classed("dimmed", false);
+      return;
+    }
+    state.nodeG.classed("dimmed", d => {
+      const queryDimmed = query && !matched.has(d.id);
+      const focusDimmed = selectedRelated && !selectedRelated.has(d.id);
+      return Boolean(queryDimmed || focusDimmed);
+    });
+    state.edgeG.classed("dimmed", e => {
+      const source = edgeEndpointId(e.source);
+      const target = edgeEndpointId(e.target);
+      const queryDimmed = query
+        && !matched.has(source)
+        && !matched.has(target)
+        && !String(e.label).toLowerCase().includes(query);
+      const focusDimmed = selectedRelated && (source !== state.selectedId && target !== state.selectedId);
+      return Boolean(queryDimmed || focusDimmed);
+    });
+  }
+
+  function edgeEndpointId(endpoint) {
+    return typeof endpoint === "object" ? endpoint.id : endpoint;
+  }
+
+  function selectedFocusIds() {
+    if (!state.selectedId || !state.neighbours) return null;
+    const related = state.neighbours.get(state.selectedId);
+    if (!related) return null;
+    return new Set([state.selectedId, ...related]);
+  }
+
+  function clearSelection() {
+    if (!state.selectedId) return;
+    state.selectedId = null;
+    state.nodeG?.classed("selected", false);
+    renderSelected(null);
+    renderLists();
+  }
+
+  async function load() {
+    const agentId = new URLSearchParams(location.search).get("agent_id") || "";
+    if (!agentId) {
+      state.view = "agents";
+      document.body.classList.add("dashboard-mode");
+      graphControlsEl.style.display = "none";
+      searchEl.placeholder = "Filter agents";
+      modeEl.textContent = "all agents";
+      const response = await fetch("memories/agents");
+      if (!response.ok) {
+        dashboardEl.innerHTML = `<div class="empty">Unable to load agents.</div>`;
+        return;
+      }
+      state.agents = await response.json();
+      renderDashboardStats(state.agents.totals || {});
+      renderAgentDashboard();
+      return;
+    }
+
+    state.view = "graph";
+    document.body.classList.remove("dashboard-mode");
+    graphControlsEl.style.display = "flex";
+    searchEl.placeholder = "Filter graph and rows";
+    modeEl.textContent = agentId;
+    const url = `memories/data?agent_id=${encodeURIComponent(agentId)}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      emptyEl.style.display = "grid";
+      return;
+    }
+    state.data = await response.json();
+    renderStats(state.data.counts || {});
+    drawCurrentGraph();
+    renderLists();
+  }
+
+  function draw(nodes, edges) {
+    if (state.sim) {
+      state.sim.stop();
+      state.sim = null;
+    }
+    d3.select(graphSvg).selectAll("*").remove();
+    emptyEl.style.display = nodes.length ? "none" : "grid";
+    if (!nodes.length) return;
+
+    const width = graphSvg.clientWidth || 900;
+    const height = graphSvg.clientHeight || 620;
+    const svg = d3.select(graphSvg);
+    const g = svg.append("g");
+    const zoom = d3.zoom().scaleExtent([0.08, 5]).on("zoom", event => g.attr("transform", event.transform));
+    svg.call(zoom);
+    svg.on("click", event => {
+      if (!event.target.closest?.(".gnode")) clearSelection();
+    });
+
+    svg.append("defs").append("marker")
+      .attr("id", "arrow")
+      .attr("viewBox", "0 -4 8 8")
+      .attr("refX", 22)
+      .attr("refY", 0)
+      .attr("markerWidth", 6)
+      .attr("markerHeight", 6)
+      .attr("orient", "auto")
+      .append("path")
+      .attr("d", "M0,-4L8,0L0,4")
+      .attr("fill", "#40505d");
+
+    const ns = nodes.map(node => ({ ...node }));
+    const nodeById = Object.fromEntries(ns.map(node => [node.id, node]));
+    const es = edges.filter(edge => nodeById[edge.source] && nodeById[edge.target]).map(edge => ({ ...edge }));
+    const neighbours = new Map(ns.map(node => [node.id, new Set()]));
+    const degree = new Map(ns.map(node => [node.id, 0]));
+    for (const edge of es) {
+      neighbours.get(edge.source)?.add(edge.target);
+      neighbours.get(edge.target)?.add(edge.source);
+      degree.set(edge.source, (degree.get(edge.source) || 0) + 1);
+      degree.set(edge.target, (degree.get(edge.target) || 0) + 1);
+    }
+
+    const radius = node => {
+      if (node.kind === "entity") return 16;
+      if (node.kind === "attribute") return 12;
+      if (node.kind === "topic") return 12;
+      return 10;
+    };
+    const labelIds = new Set();
+    if (ns.length > 90) {
+      for (const topic of ns.filter(node => node.kind === "topic")) labelIds.add(topic.id);
+      const labelLimit = ns.length > 160 ? 64 : 120;
+      const candidates = sortedByDegree(
+        ns.filter(node => ["entity", "attribute"].includes(node.kind)),
+        degree,
+      );
+      for (const node of candidates) {
+        if (labelIds.size >= labelLimit) break;
+        labelIds.add(node.id);
+      }
+    }
+    const showNodeLabel = node => {
+      if (ns.length <= 90) return true;
+      if (labelIds.has(node.id)) return true;
+      if (ns.length <= 160) return isUnitNode(node) && (degree.get(node.id) || 0) >= 3;
+      return false;
+    };
+
+    const edgeG = g.append("g").selectAll(".gedge")
+      .data(es)
+      .join("g")
+      .attr("class", d => `gedge ${d.kind || "relation"}`);
+    const edgeLine = edgeG.append("line").attr("marker-end", "url(#arrow)");
+    const edgeText = edgeG.append("text")
+      .text(d => d.label)
+      .style("display", es.length <= 90 && state.graphView !== "full" ? null : "none");
+
+    let sim = null;
+    const nodeG = g.append("g").selectAll(".gnode")
+      .data(ns)
+      .join("g")
+      .attr("class", d => `gnode ${d.kind}`)
+      .call(d3.drag()
+        .on("start", (event, d) => {
+          if (sim && !event.active) sim.alphaTarget(0.25).restart();
+          d.fx = d.x;
+          d.fy = d.y;
+        })
+        .on("drag", (event, d) => {
+          d.fx = event.x;
+          d.fy = event.y;
+          d.x = event.x;
+          d.y = event.y;
+          if (!sim) ticked();
+        })
+        .on("end", (event, d) => {
+          if (sim && !event.active) sim.alphaTarget(0);
+          d.fx = null;
+          d.fy = null;
+        }));
+
+    state.nodeG = nodeG;
+    state.edgeG = edgeG;
+    state.neighbours = neighbours;
+
+    nodeG.filter(d => d.kind === "topic")
+      .append("polygon")
+      .attr("points", d => {
+        const r = radius(d);
+        return `0,${-r} ${r},0 0,${r} ${-r},0`;
+      });
+    nodeG.filter(d => d.kind !== "topic").append("circle").attr("r", radius);
+    nodeG.append("text")
+      .attr("dy", d => radius(d) + 13)
+      .text(d => trunc(d.label, 24))
+      .style("display", d => showNodeLabel(d) ? null : "none");
+
+    nodeG.on("mouseenter", (event, d) => {
+        const related = neighbours.get(d.id) || new Set();
+        nodeG.classed("dimmed", n => n.id !== d.id && !related.has(n.id));
+        edgeG.classed("dimmed", edge => {
+          const source = edgeEndpointId(edge.source);
+          const target = edgeEndpointId(edge.target);
+          return source !== d.id && target !== d.id;
+        });
+        tooltip.innerHTML = `<strong>${esc(d.label)}</strong><br><span class="muted">${esc(d.kind)}</span>${d.description ? `<br>${esc(d.description)}` : ""}`;
+        tooltip.style.display = "block";
+      })
+      .on("mousemove", event => {
+        const rect = graphSvg.getBoundingClientRect();
+        let x = event.clientX - rect.left + 14;
+        let y = event.clientY - rect.top + 14;
+        if (x + 330 > rect.width) x -= 350;
+        if (y + 130 > rect.height) y -= 150;
+        tooltip.style.left = `${x}px`;
+        tooltip.style.top = `${y}px`;
+      })
+      .on("mouseleave", () => {
+        tooltip.style.display = "none";
+        applyGraphFilter(searchEl.value.trim().toLowerCase());
+      })
+      .on("click", (event, d) => {
+        event.stopPropagation();
+        state.selectedId = d.id;
+        nodeG.classed("selected", node => node.id === d.id);
+        applyGraphFilter(searchEl.value.trim().toLowerCase());
+        renderSelected(d);
+        renderLists();
+      });
+
+    const layoutMode = resolveLayoutMode(ns);
+    if (layoutMode === "radial") {
+      placeRadialLayout(ns, width, height, degree);
+      ticked();
+      fitGraphToViewport(svg, zoom, ns, width, height, radius);
+      return;
+    }
+    if (layoutMode === "lanes") {
+      placeLaneLayout(ns, width, height, degree);
+      ticked();
+      fitGraphToViewport(svg, zoom, ns, width, height, radius);
+      return;
+    }
+
+    seedLayout(ns, width, height);
+    sim = d3.forceSimulation(ns)
+      .force("link", d3.forceLink(es).id(d => d.id).distance(linkDistance).strength(0.28).iterations(2))
+      .force("charge", d3.forceManyBody().strength(d => isUnitNode(d) ? -420 : -620))
+      .force("x", d3.forceX(width / 2).strength(0.025))
+      .force("y", d3.forceY(height / 2).strength(0.025))
+      .force("collision", d3.forceCollide(d => radius(d) + 18).iterations(2))
+      .alphaDecay(0.035)
+      .on("tick", ticked);
+    state.sim = sim;
+
+    sim.stop();
+    sim.tick(Math.min(180, 70 + ns.length));
+    ticked();
+    fitGraphToViewport(svg, zoom, ns, width, height, radius);
+    sim.alpha(0.28).restart();
+
+    function ticked() {
+      edgeLine
+        .attr("x1", d => edgeEndpointNode(d.source).x)
+        .attr("y1", d => edgeEndpointNode(d.source).y)
+        .attr("x2", d => edgeEndpointNode(d.target).x)
+        .attr("y2", d => edgeEndpointNode(d.target).y);
+      edgeText
+        .attr("x", d => (edgeEndpointNode(d.source).x + edgeEndpointNode(d.target).x) / 2)
+        .attr("y", d => (edgeEndpointNode(d.source).y + edgeEndpointNode(d.target).y) / 2 - 5);
+      nodeG.attr("transform", d => `translate(${d.x},${d.y})`);
+    }
+
+    function edgeEndpointNode(endpoint) {
+      return typeof endpoint === "object" ? endpoint : nodeById[endpoint];
+    }
+
+    function linkDistance(edge) {
+      const source = edgeEndpointNode(edge.source);
+      const target = edgeEndpointNode(edge.target);
+      if (source?.kind === "attribute" || target?.kind === "attribute") return 140;
+      if (isUnitNode(source) || isUnitNode(target)) return 170;
+      return edge.label === "tagged_with" ? 150 : 190;
+    }
+  }
+
+  function resolveLayoutMode(nodes) {
+    if (state.graphLayout !== "auto") return state.graphLayout;
+    if (state.graphView === "map") return "radial";
+    if (state.graphView === "full" || nodes.length > 140) return "lanes";
+    return "spread";
+  }
+
+  function seedLayout(nodes, width, height) {
+    const radius = Math.max(160, Math.min(width, height) * 0.42);
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const count = Math.max(nodes.length, 1);
+    for (const [index, node] of nodes.entries()) {
+      const angle = index * 2.399963229728653;
+      const distance = radius * Math.sqrt((index + 0.5) / count);
+      node.x = centerX + Math.cos(angle) * distance;
+      node.y = centerY + Math.sin(angle) * distance;
+    }
+  }
+
+  function sortedByDegree(nodes, degree) {
+    return [...nodes].sort((left, right) => {
+      const degreeDiff = (degree.get(right.id) || 0) - (degree.get(left.id) || 0);
+      if (degreeDiff) return degreeDiff;
+      return String(left.label || left.id).localeCompare(String(right.label || right.id));
+    });
+  }
+
+  function placeRadialLayout(nodes, width, height, degree) {
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const groups = [
+      ["topic", nodes.filter(node => node.kind === "topic")],
+      ["entity", nodes.filter(node => node.kind === "entity")],
+      ["attribute", nodes.filter(node => node.kind === "attribute")],
+      ["semantic", nodes.filter(node => node.kind === "semantic")],
+      ["episodic", nodes.filter(node => node.kind === "episodic")],
+      ["procedural", nodes.filter(node => node.kind === "procedural")],
+      ["other", nodes.filter(node => !["topic", "entity", "attribute", "semantic", "episodic", "procedural"].includes(node.kind))],
+    ].filter(([, groupNodes]) => groupNodes.length);
+    let ringRadius = 80;
+    for (const [, groupNodes] of groups) {
+      const sorted = sortedByDegree(groupNodes, degree);
+      while (sorted.length) {
+        const capacity = Math.max(8, Math.floor((2 * Math.PI * ringRadius) / 76));
+        const ringNodes = sorted.splice(0, capacity);
+        const angleOffset = (ringRadius / 47) % (Math.PI * 2);
+        for (const [index, node] of ringNodes.entries()) {
+          const angle = angleOffset + (index / ringNodes.length) * Math.PI * 2;
+          node.x = centerX + Math.cos(angle) * ringRadius;
+          node.y = centerY + Math.sin(angle) * ringRadius;
+        }
+        ringRadius += 92;
+      }
+      ringRadius += 36;
+    }
+  }
+
+  function placeLaneLayout(nodes, width, height, degree) {
+    const groups = [
+      ["topic", nodes.filter(node => node.kind === "topic")],
+      ["entity", nodes.filter(node => node.kind === "entity")],
+      ["attribute", nodes.filter(node => node.kind === "attribute")],
+      ["semantic", nodes.filter(node => node.kind === "semantic")],
+      ["episodic", nodes.filter(node => node.kind === "episodic")],
+      ["procedural", nodes.filter(node => node.kind === "procedural")],
+      ["other", nodes.filter(node => !["topic", "entity", "attribute", "semantic", "episodic", "procedural"].includes(node.kind))],
+    ].filter(([, groupNodes]) => groupNodes.length);
+    const rowGap = 68;
+    const colGap = 74;
+    const laneGap = 150;
+    const maxRows = Math.max(6, Math.floor(Math.max(height, 620) / rowGap));
+    let x = 80;
+    for (const [, groupNodes] of groups) {
+      const sorted = sortedByDegree(groupNodes, degree);
+      const columns = Math.max(1, Math.ceil(sorted.length / maxRows));
+      for (const [index, node] of sorted.entries()) {
+        const column = Math.floor(index / maxRows);
+        const row = index % maxRows;
+        node.x = x + column * colGap;
+        node.y = 80 + row * rowGap;
+      }
+      x += columns * colGap + laneGap;
+    }
+    const bounds = nodes.reduce((acc, node) => ({
+      minX: Math.min(acc.minX, node.x),
+      minY: Math.min(acc.minY, node.y),
+      maxX: Math.max(acc.maxX, node.x),
+      maxY: Math.max(acc.maxY, node.y),
+    }), { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
+    const dx = width / 2 - (bounds.minX + bounds.maxX) / 2;
+    const dy = height / 2 - (bounds.minY + bounds.maxY) / 2;
+    for (const node of nodes) {
+      node.x += dx;
+      node.y += dy;
+    }
+  }
+
+  function fitGraphToViewport(svg, zoom, nodes, width, height, radius) {
+    const positioned = nodes.filter(node => Number.isFinite(node.x) && Number.isFinite(node.y));
+    if (!positioned.length) return;
+    const pad = 88;
+    const bounds = positioned.reduce((acc, node) => {
+      const r = radius(node) + 34;
+      return {
+        minX: Math.min(acc.minX, node.x - r),
+        minY: Math.min(acc.minY, node.y - r),
+        maxX: Math.max(acc.maxX, node.x + r),
+        maxY: Math.max(acc.maxY, node.y + r),
+      };
+    }, { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
+    const graphWidth = Math.max(1, bounds.maxX - bounds.minX);
+    const graphHeight = Math.max(1, bounds.maxY - bounds.minY);
+    const scale = Math.max(0.08, Math.min(1.35, Math.min(
+      (width - pad) / graphWidth,
+      (height - pad) / graphHeight,
+    )));
+    const centerX = (bounds.minX + bounds.maxX) / 2;
+    const centerY = (bounds.minY + bounds.maxY) / 2;
+    const transform = d3.zoomIdentity
+      .translate(width / 2 - scale * centerX, height / 2 - scale * centerY)
+      .scale(scale);
+    svg.transition().duration(220).call(zoom.transform, transform);
+  }
+
+  load();
+</script>
+</body>
+</html>

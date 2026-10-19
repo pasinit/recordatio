@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=72", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tpasini-recordatio"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = []  # managed via requirements.in → pip-compile
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tpasini"]
+
+[project.scripts]
+agentmem = "tpasini.recordatio.cli:main"
+agentmem-backfill = "tpasini.recordatio.backfill:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

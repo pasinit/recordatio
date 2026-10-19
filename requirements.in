@@ -1,0 +1,26 @@
+# Runtime dependencies
+anthropic>=0.49
+claude-agent-sdk>=0.2.93
+pydantic-settings>=2.0
+# Pinned exactly: lemma data ships with the package and the retrieval index
+# stores lemmatized text — a version bump is an index-format change (RETRIEVAL_DESIGN.md §3.1).
+simplemma==1.2.0
+pontifex @ git+https://github.com/pasinit/pontifex.git@6f1eb4f6ee6db046da79658fa3518cb6f9cbdb26
+beautifulsoup4>=4.12
+fastapi>=0.115
+httpx>=0.28
+mcp>=1.2
+opentelemetry-api>=1.27
+opentelemetry-sdk>=1.27
+opentelemetry-exporter-otlp>=1.27
+opentelemetry-instrumentation-fastapi>=0.48b0
+opentelemetry-instrumentation-httpx>=0.48b0
+opentelemetry-instrumentation-logging>=0.48b0
+tiktoken>=0.7
+uvicorn[standard]>=0.34
+# Pinned exactly: cross-encoder checkpoint weights are tied to this version;
+# a version bump is a model-format change requiring a frozen-scores regeneration
+# (RERANKING_DESIGN.md §6). CPU-only; no GPU dependency.
+# Pinned model: BAAI/bge-reranker-base (swapped from ms-marco-MiniLM-L-6-v2
+# 2026-06-14; sanity-gate passed; see experiments/2026-06-14-reranking/findings.md).
+sentence-transformers==5.5.1

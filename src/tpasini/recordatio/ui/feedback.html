@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>agentmem — memory feedback</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f1117; --surface: #1a1d27; --border: #2e3245;
+      --accent: #7c6aff; --accent-dim: #3d3478;
+      --text: #e2e4f0; --text-muted: #7880a0;
+      --success: #5eead4; --danger: #ff6b6b; --warn: #fb923c;
+      --font: "Inter", system-ui, sans-serif;
+      --mono: "JetBrains Mono", "Fira Code", monospace;
+    }
+    body { font-family: var(--font); background: var(--bg); color: var(--text); min-height: 100dvh; }
+    header {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--surface);
+    }
+    header h1 { font-size: 1rem; font-weight: 600; letter-spacing: -0.02em; }
+    .badge {
+      font-size: 0.65rem; font-weight: 600; padding: 2px 7px; border-radius: 99px;
+      background: var(--accent-dim); color: var(--accent);
+      text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    nav { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+    nav a {
+      font-size: 0.75rem; padding: 4px 10px; border-radius: 4px;
+      color: var(--text-muted); background: transparent; border: 1px solid var(--border);
+      text-decoration: none;
+    }
+    nav a:hover { color: var(--text); border-color: var(--accent-dim); }
+    nav button.accept-all {
+      font-size: 0.75rem; font-weight: 600; padding: 4px 12px; border-radius: 4px;
+      color: var(--success); background: transparent; border: 1px solid #2c5c52;
+      cursor: pointer; font-family: inherit;
+    }
+    nav button.accept-all:hover { background: #12332d; }
+    nav button.accept-all:disabled { opacity: 0.4; cursor: default; }
+    main { max-width: 960px; margin: 0 auto; padding: 24px 20px; }
+
+    .record {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px 18px; margin-bottom: 18px;
+    }
+    .record-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+    .record-head .who { font-weight: 600; font-family: var(--mono); font-size: 0.85rem; }
+    .record-head .day { color: var(--text-muted); font-size: 0.75rem; font-family: var(--mono); }
+    .summary { color: var(--text); font-size: 0.9rem; margin: 4px 0 12px; }
+
+    .findings { list-style: none; margin: 0 0 12px; }
+    .findings li { font-size: 0.8rem; color: var(--text-muted); padding: 3px 0; }
+    .findings .kind { color: var(--warn); font-family: var(--mono); font-size: 0.72rem; }
+
+    .ops { display: flex; flex-direction: column; gap: 8px; }
+    .op {
+      border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+      background: rgba(0,0,0,0.18); display: flex; gap: 12px; align-items: flex-start;
+    }
+    .op-body { flex: 1; min-width: 0; }
+    .op-type {
+      font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+      padding: 2px 7px; border-radius: 4px; background: var(--accent-dim); color: var(--accent);
+    }
+    .op-target { font-family: var(--mono); font-size: 0.75rem; color: var(--text); margin-top: 6px; word-break: break-word; }
+    .op-reason { font-size: 0.8rem; color: var(--text-muted); margin-top: 4px; }
+    .op-decided { font-size: 0.72rem; font-family: var(--mono); margin-top: 6px; }
+    .op-decided.applied { color: var(--success); }
+    .op-decided.dismissed { color: var(--text-muted); }
+
+    .op-actions { display: flex; gap: 6px; flex-shrink: 0; }
+    button {
+      font-size: 0.72rem; font-weight: 600; padding: 5px 11px; border-radius: 5px;
+      border: 1px solid var(--border); cursor: pointer; font-family: inherit; background: transparent;
+    }
+    button.apply { color: var(--success); border-color: #2c5c52; }
+    button.apply:hover { background: #12332d; }
+    button.dismiss { color: var(--text-muted); }
+    button.dismiss:hover { color: var(--danger); border-color: #5c2c2c; }
+    button:disabled { opacity: 0.4; cursor: default; }
+
+    .status-pill { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; align-self: center; }
+    .status-pill.applied { color: var(--success); }
+    .status-pill.dismissed { color: var(--text-muted); }
+
+    .empty { padding: 48px; text-align: center; color: var(--text-muted); font-size: 0.9rem; }
+    .err { color: var(--danger); font-family: var(--mono); font-size: 0.85rem; padding: 12px; }
+    .toast {
+      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 16px; font-size: 0.8rem; opacity: 0; transition: opacity 0.2s; pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+    .toast.error { border-color: #5c2c2c; color: var(--danger); }
+  </style>
+</head>
+<body>
+<header>
+  <h1>agentmem</h1>
+  <span class="badge">memory feedback</span>
+  <nav>
+    <button id="accept-all" class="accept-all">Accept all pending</button>
+    <a href="memories">memories →</a>
+    <a href="costs">costs →</a>
+  </nav>
+</header>
+
+<main id="root"><div class="empty">Loading…</div></main>
+<div id="toast" class="toast"></div>
+
+<script>
+const root = document.getElementById("root");
+const toastEl = document.getElementById("toast");
+
+function toast(msg, isError) {
+  toastEl.textContent = msg;
+  toastEl.className = "toast show" + (isError ? " error" : "");
+  setTimeout(() => { toastEl.className = "toast"; }, 2600);
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function targetLine(op) {
+  const t = op.target || {};
+  if (op.op_type === "tombstone") return "unit " + esc(t.unit_id);
+  if (op.op_type === "merge") return esc((t.duplicate_ids || []).join(", ")) + " → " + esc(t.canonical_id);
+  if (op.op_type === "correct") return "unit " + esc(t.unit_id) + " ⇒ " + esc(t.new_content);
+  return esc(JSON.stringify(t));
+}
+
+function opHtml(op) {
+  let right;
+  if (op.status === "pending") {
+    right = `<div class="op-actions">
+      <button class="apply" data-op="${op.id}" data-action="apply">Apply</button>
+      <button class="dismiss" data-op="${op.id}" data-action="dismiss">Dismiss</button>
+    </div>`;
+  } else {
+    right = `<span class="status-pill ${op.status}">${op.status}</span>`;
+  }
+  const decided = op.status !== "pending" && op.decided_result
+    ? `<div class="op-decided ${op.status}">${esc(op.decided_result)}</div>` : "";
+  return `<div class="op">
+    <div class="op-body">
+      <span class="op-type">${esc(op.op_type)}</span>
+      <div class="op-target">${targetLine(op)}</div>
+      ${op.reason ? `<div class="op-reason">${esc(op.reason)}</div>` : ""}
+      ${decided}
+    </div>
+    ${right}
+  </div>`;
+}
+
+function recordHtml(rec) {
+  const findings = (rec.findings || []).map(f =>
+    `<li><span class="kind">${esc(f.kind || "note")}</span> ${esc(f.detail || "")}</li>`).join("");
+  return `<div class="record">
+    <div class="record-head">
+      <span class="who">${esc(rec.user_id)}</span>
+      <span class="day">${esc(rec.day)}</span>
+    </div>
+    <div class="summary">${esc(rec.summary)}</div>
+    ${findings ? `<ul class="findings">${findings}</ul>` : ""}
+    <div class="ops">${(rec.ops || []).map(opHtml).join("")}</div>
+  </div>`;
+}
+
+async function load() {
+  try {
+    const resp = await fetch("feedback/data", { headers: { "Accept": "application/json" } });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    const records = data.records || [];
+    if (!records.length) { root.innerHTML = `<div class="empty">No memory feedback yet. The nightly run posts here.</div>`; return; }
+    root.innerHTML = records.map(recordHtml).join("");
+    bind();
+  } catch (e) {
+    root.innerHTML = `<div class="err">Failed to load feedback: ${esc(e.message)}</div>`;
+  }
+}
+
+function bind() {
+  root.querySelectorAll("button[data-op]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const opId = btn.dataset.op, action = btn.dataset.action;
+      root.querySelectorAll(`button[data-op="${opId}"]`).forEach(b => b.disabled = true);
+      try {
+        const resp = await fetch(`feedback/ops/${opId}/${action}`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        });
+        const body = await resp.json();
+        if (!resp.ok) throw new Error(body.error || ("HTTP " + resp.status));
+        toast(action === "apply" ? (body.result || "applied") : "dismissed", false);
+        load();
+      } catch (e) {
+        toast(e.message, true);
+        root.querySelectorAll(`button[data-op="${opId}"]`).forEach(b => b.disabled = false);
+      }
+    });
+  });
+}
+
+const acceptAllBtn = document.getElementById("accept-all");
+acceptAllBtn.addEventListener("click", async () => {
+  if (!window.confirm("Apply ALL pending memory ops? Valid ones are applied (this mutates the store); invalid suggestions (incomplete/unknown unit ids) are auto-rejected.")) return;
+  acceptAllBtn.disabled = true;
+  acceptAllBtn.textContent = "Applying…";
+  try {
+    const resp = await fetch("feedback/apply-all", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const b = await resp.json();
+    if (!resp.ok) throw new Error(b.error || ("HTTP " + resp.status));
+    toast(`Applied ${b.applied}, auto-rejected ${b.rejected}${b.failed ? ", failed " + b.failed : ""}`, false);
+    load();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    acceptAllBtn.disabled = false;
+    acceptAllBtn.textContent = "Accept all pending";
+  }
+});
+
+load();
+</script>
+</body>
+</html>

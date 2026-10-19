@@ -1,0 +1,16 @@
+# Constrain the runtime deps to the exact versions the prod lockfile
+# (and the Docker image) already pin, so the dev/test environment matches
+# what ships. Without this, ``-r requirements.in``'s loose ``>=`` bounds
+# re-resolve to whatever is newest at compile time, which is how
+# requirements-dev.txt drifted from — and fell behind — requirements.txt
+# (it predated the sentence-transformers/embeddings stack entirely, so
+# ``make test`` failed on ModuleNotFoundError: numpy).
+-c requirements.txt
+-r requirements.in
+
+# Testing
+pytest
+pytest-asyncio
+
+# Linting
+ruff
