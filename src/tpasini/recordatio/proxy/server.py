@@ -52,7 +52,7 @@ from tpasini.recordatio.models import (
     RenderedRelation,
 )
 from tpasini.recordatio.observability import init_tracing, mark_error, span
-from tpasini.recordatio.proxy import extraction_persistence, extraction_pipeline, prompting, retrieval
+from tpasini.recordatio.proxy import extraction_persistence, extraction_pipeline, network_guard, prompting, retrieval
 from tpasini.recordatio.proxy import runtime as _runtime
 from tpasini.recordatio.proxy.agent_endpoints import register_agent_routes, register_user_routes
 from tpasini.recordatio.proxy.briefing_log import BriefingLog
@@ -162,6 +162,7 @@ def _ensure_user_entity(agent_id: str) -> None:
 
 app = FastAPI(title="agentmem")
 init_tracing(app, settings.otel_exporter_otlp_endpoint, settings.otel_service_name)
+network_guard.install(app, settings.recordatio_restricted_networks, settings.recordatio_recall_key_sha256)
 
 _background_tasks: set[asyncio.Task] = set()
 
