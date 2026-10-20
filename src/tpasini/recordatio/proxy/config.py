@@ -20,6 +20,16 @@ class Settings(BaseSettings):
     recordatio_subscription_provider: Literal["claude", "codex"] = "claude"
     recordatio_agent_api_fallback: bool | None = None
 
+    # Auto-drain the nightly memory-feedback op queue. When enabled, the
+    # reversible, low-risk op classes (tombstone / merge) the analyst emits are
+    # applied immediately after a nightly memory-feedback record is POSTed,
+    # instead of waiting for a manual dashboard click that in practice never
+    # happens. The ambiguous `correct` class is always left pending for human
+    # review. Off by default so existing deployments are unchanged until an
+    # operator opts in. Every applied op remains fully reversible (tombstone
+    # sets valid_until; merge tombstones only the duplicates).
+    recordatio_auto_apply_safe_ops: bool = False
+
     # MCP stays restricted to loopback and the default Compose service.
     # JSON array override for deployments using another trusted hostname.
     recordatio_mcp_allowed_hosts: list[str] = ["127.0.0.1:*", "localhost:*", "[::1]:*", "recordatio:8787"]

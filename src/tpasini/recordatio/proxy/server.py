@@ -1002,6 +1002,7 @@ register_feedback_routes(
     get_store=lambda: store,
     memory_feedback_store=memory_feedback_store,
     user_label=_USER_ENTITY_LABEL,
+    auto_apply_safe_ops=settings.recordatio_auto_apply_safe_ops,
 )
 
 

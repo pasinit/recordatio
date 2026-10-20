@@ -20,9 +20,12 @@ from tpasini.recordatio.storage.memory_feedback import MemoryFeedbackStore
 _AUTH = {"authorization": "Bearer test-key"}
 
 
-def _app(store: SQLiteStore, fb: MemoryFeedbackStore) -> FastAPI:
+def _app(store: SQLiteStore, fb: MemoryFeedbackStore, *, auto_apply_safe_ops: bool = False) -> FastAPI:
     app = FastAPI()
-    register_feedback_routes(app, get_store=lambda: store, memory_feedback_store=fb, user_label="User")
+    register_feedback_routes(
+        app, get_store=lambda: store, memory_feedback_store=fb, user_label="User",
+        auto_apply_safe_ops=auto_apply_safe_ops,
+    )
     return app
 
 
@@ -293,3 +296,110 @@ async def test_memory_feedback_post_rejects_bad_op(client: httpx.AsyncClient) ->
         json={"day": "2026-07-31", "summary": "x", "ops": [{"op_type": "nuke"}]},
     )
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Auto-drain of the safe-class op queue on POST (opt-in)
+# ---------------------------------------------------------------------------
+
+
+async def test_post_auto_applies_safe_ops_when_enabled(tmp_path: Path) -> None:
+    """Regression: the nightly op queue was never drained automatically — the
+    only apply path was a manual dashboard click, so analyst-proposed reversible
+    ops sat ``pending`` forever and contradicted memory stayed live. With
+    ``auto_apply_safe_ops`` on, the reversible safe classes (tombstone/merge)
+    are applied the moment the analyst POSTs the record; ``correct`` stays
+    pending for human review."""
+    import uuid
+
+    at = datetime(2026, 7, 31, 9, 0, tzinfo=UTC)
+    dup_id = str(uuid.uuid4())
+    canonical_id = str(uuid.uuid4())
+    stale_id = str(uuid.uuid4())
+    correct_id = str(uuid.uuid4())
+    store = SQLiteStore(tmp_path / "mem.db")
+    for uid, content in [
+        (dup_id, "Palace Court unit already applied"),
+        (canonical_id, "canonical Palace Court unit"),
+        (stale_id, "Gloucester Terrace permanently excluded"),
+        (correct_id, "Sam is a junior analyst"),
+    ]:
+        store.add(_unit(content, asserted=at, uid=uid), "sam/scout")
+    fb = MemoryFeedbackStore(tmp_path / "fb.db")
+
+    async with await _client(_app(store, fb, auto_apply_safe_ops=True)) as c:
+        resp = await c.post(
+            "/v1/users/sam/memory-feedback",
+            json={
+                "day": "2026-07-31",
+                "summary": "drain the queue",
+                "findings": [],
+                "ops": [
+                    {"op_type": "tombstone", "target": {"unit_id": stale_id}, "reason": "stale exclusion"},
+                    {"op_type": "merge",
+                     "target": {"canonical_id": canonical_id, "duplicate_ids": [dup_id]}, "reason": "dup"},
+                    {"op_type": "correct",
+                     "target": {"unit_id": correct_id, "new_content": "Sam is a senior analyst"}, "reason": "title"},
+                ],
+            },
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["auto_applied"] == 2  # tombstone + merge
+    assert body["auto_rejected"] == 0
+
+    # The reversible ops actually mutated memory...
+    active = {u.id for u, _ in store.list_units_for_user("sam")}
+    assert stale_id not in active  # tombstoned
+    assert dup_id not in active    # merged away
+    assert canonical_id in active  # canonical untouched
+    # ...and the ambiguous `correct` op was left for a human.
+    statuses = {o.op_type: o.status for rec in fb.list_feedback("sam") for o in fb.list_ops(rec.id)}
+    assert statuses == {"tombstone": "applied", "merge": "applied", "correct": "pending"}
+
+
+async def test_post_leaves_ops_pending_when_auto_apply_disabled(tmp_path: Path) -> None:
+    """Default (opt-out) behaviour is unchanged: ops stay pending for the
+    dashboard, and the response carries no auto-apply counters."""
+    import uuid
+
+    at = datetime(2026, 7, 31, 9, 0, tzinfo=UTC)
+    stale_id = str(uuid.uuid4())
+    store = SQLiteStore(tmp_path / "mem.db")
+    store.add(_unit("stale", asserted=at, uid=stale_id), "sam/scout")
+    fb = MemoryFeedbackStore(tmp_path / "fb.db")
+    async with await _client(_app(store, fb)) as c:  # default: disabled
+        resp = await c.post(
+            "/v1/users/sam/memory-feedback",
+            json={"day": "2026-07-31", "summary": "x", "findings": [],
+                  "ops": [{"op_type": "tombstone", "target": {"unit_id": stale_id}, "reason": "stale"}]},
+        )
+    assert resp.status_code == 200
+    assert "auto_applied" not in resp.json()
+    assert {u.id for u, _ in store.list_units_for_user("sam")} == {stale_id}  # untouched
+    statuses = {o.status for rec in fb.list_feedback("sam") for o in fb.list_ops(rec.id)}
+    assert statuses == {"pending"}
+
+
+async def test_post_auto_apply_rejects_malformed_safe_op(tmp_path: Path) -> None:
+    """The auto-drain reuses apply_all_pending's safety envelope: a malformed
+    op (truncated uuid) is auto-rejected, never guessed at or left dangling."""
+    import uuid
+
+    at = datetime(2026, 7, 31, 9, 0, tzinfo=UTC)
+    good_id = str(uuid.uuid4())
+    store = SQLiteStore(tmp_path / "mem.db")
+    store.add(_unit("good", asserted=at, uid=good_id), "sam/scout")
+    fb = MemoryFeedbackStore(tmp_path / "fb.db")
+    async with await _client(_app(store, fb, auto_apply_safe_ops=True)) as c:
+        resp = await c.post(
+            "/v1/users/sam/memory-feedback",
+            json={"day": "2026-07-31", "summary": "x", "findings": [],
+                  "ops": [{"op_type": "tombstone", "target": {"unit_id": good_id[:8]}, "reason": "truncated"}]},
+        )
+    body = resp.json()
+    assert body["auto_applied"] == 0
+    assert body["auto_rejected"] == 1
+    assert {u.id for u, _ in store.list_units_for_user("sam")} == {good_id}  # untouched
+    statuses = {o.status for rec in fb.list_feedback("sam") for o in fb.list_ops(rec.id)}
+    assert statuses == {"dismissed"}
