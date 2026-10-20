@@ -26,7 +26,8 @@ class Settings(BaseSettings):
 
     # Read-only remote access (proxy/network_guard.py). JSON arrays. Callers from
     # these CIDRs must present a recall key; a recall key (stored as its SHA-256
-    # hex digest) may only call GET /v1/users/{user_id}/memory-search.
+    # hex digest) may only call GET /v1/users/{user_id}/memory-search and
+    # GET /v1/users/{user_id}/briefing.
     recordatio_restricted_networks: list[str] = []
     recordatio_recall_key_sha256: list[str] = []
 

@@ -12,6 +12,8 @@ RECALL_KEY = "recall-key-for-tests"
 RECALL_HASH = hashlib.sha256(RECALL_KEY.encode()).hexdigest()
 VPC = ["10.1.0.0/20"]
 SEARCH = "/v1/users/sam/memory-search"
+BRIEFING = "/v1/users/sam/briefing"
+TRANSCRIPTS = "/v1/agents/sam/assistant/transcripts"
 
 
 def _decide(client: str | None, method: str, path: str, key: str | None,
@@ -30,12 +32,28 @@ def test_restricted_network_needs_a_recall_key() -> None:
     assert _decide("10.1.0.3", "GET", SEARCH, RECALL_KEY) is None
 
 
-def test_recall_key_may_only_search() -> None:
+def test_restricted_network_may_read_a_briefing_with_a_recall_key() -> None:
+    assert _decide("10.1.0.3", "GET", BRIEFING, None) == 401
+    assert _decide("10.1.0.3", "GET", BRIEFING, RECALL_KEY) is None
+    assert _decide("172.18.0.5", "GET", BRIEFING, RECALL_KEY) is None
+
+
+def test_recall_key_may_only_search_or_read_briefings() -> None:
     for client in ("10.1.0.3", "172.18.0.5"):
         assert _decide(client, "POST", SEARCH, RECALL_KEY) == 403
+        assert _decide(client, "POST", BRIEFING, RECALL_KEY) == 403
+        assert _decide(client, "GET", "/v1/users/sam/briefing/extra", RECALL_KEY) == 403
         assert _decide(client, "GET", "/v1/users/sam/memory-day", RECALL_KEY) == 403
         assert _decide(client, "GET", "/v1/users/sam/memory-search/extra", RECALL_KEY) == 403
         assert _decide(client, "POST", "/v1/chat/completions", RECALL_KEY) == 403
+
+
+def test_transcript_ingest_is_local_only() -> None:
+    for client in ("10.1.0.3", "172.18.0.5"):
+        assert _decide(client, "POST", TRANSCRIPTS, RECALL_KEY) == 403
+    assert _decide("10.1.0.3", "POST", TRANSCRIPTS, None) == 401
+    assert _decide("10.1.0.3", "POST", TRANSCRIPTS, "telos-key") == 401
+    assert _decide("172.18.0.5", "POST", TRANSCRIPTS, "telos-key") is None
 
 
 def test_unparseable_peer_fails_closed_only_when_restrictions_are_on() -> None:
@@ -56,6 +74,14 @@ def _app() -> FastAPI:
     @app.get("/v1/users/{user_id}/memory-search")
     async def search(user_id: str) -> dict[str, str]:
         return {"user_id": user_id}
+
+    @app.get("/v1/users/{user_id}/briefing")
+    async def briefing(user_id: str) -> dict[str, str | int]:
+        return {"briefing": "", "units": 0}
+
+    @app.post("/v1/agents/{user_id}/{slug}/transcripts")
+    async def transcripts(user_id: str, slug: str) -> dict[str, bool]:
+        return {"duplicate": False}
 
     @app.post("/v1/users/{user_id}/units")
     async def write(user_id: str) -> dict[str, str]:
@@ -80,6 +106,13 @@ async def _status(client_host: str, method: str, path: str, key: str | None) -> 
         ("10.1.0.3", "POST", "/v1/users/sam/units", RECALL_KEY, 403),
         ("172.18.0.5", "POST", "/v1/users/sam/units", "telos-key", 200),
         ("172.18.0.5", "POST", "/v1/users/sam/units", RECALL_KEY, 403),
+        ("10.1.0.3", "GET", BRIEFING, RECALL_KEY, 200),
+        ("172.18.0.5", "GET", BRIEFING, RECALL_KEY, 200),
+        ("10.1.0.3", "GET", BRIEFING, None, 401),
+        ("172.18.0.5", "POST", TRANSCRIPTS, "telos-key", 200),
+        ("172.18.0.5", "POST", TRANSCRIPTS, RECALL_KEY, 403),
+        ("10.1.0.3", "POST", TRANSCRIPTS, RECALL_KEY, 403),
+        ("10.1.0.3", "POST", TRANSCRIPTS, "telos-key", 401),
     ],
 )
 async def test_middleware_end_to_end(client_host: str, method: str, path: str, key: str | None, expected: int) -> None:

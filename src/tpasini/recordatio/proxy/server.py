@@ -55,6 +55,7 @@ from tpasini.recordatio.observability import init_tracing, mark_error, span
 from tpasini.recordatio.proxy import extraction_persistence, extraction_pipeline, network_guard, prompting, retrieval
 from tpasini.recordatio.proxy import runtime as _runtime
 from tpasini.recordatio.proxy.agent_endpoints import register_agent_routes, register_user_routes
+from tpasini.recordatio.proxy.agent_memory_routes import register_agent_memory_routes
 from tpasini.recordatio.proxy.briefing_log import BriefingLog
 from tpasini.recordatio.proxy.briefing_routes import register_briefing_event_routes
 from tpasini.recordatio.proxy.cost_log import CostLog
@@ -80,6 +81,7 @@ from tpasini.recordatio.proxy.runtime import (
 from tpasini.recordatio.proxy.runtime import (
     resolve_model as _resolve_model,
 )
+from tpasini.recordatio.proxy.transcript_log import TranscriptLog
 from tpasini.recordatio.storage.base import SQLiteStore
 from tpasini.recordatio.storage.memory_feedback import MemoryFeedbackStore
 from tpasini.recordatio.wikidata import resolve_entity
@@ -120,6 +122,9 @@ _AGENT_RATE_LIMIT_DB_PATH = _DB_PATH.parent / (
 )
 agent_config_store = AgentConfigStore(_AGENT_CONFIG_DB_PATH)
 agent_rate_state = RateLimitStateStore(_AGENT_RATE_LIMIT_DB_PATH)
+
+# Idempotency keys of transcripts ingested via POST /v1/agents/.../transcripts.
+transcript_log = TranscriptLog(_DB_PATH.parent / "transcripts.db")
 
 # Nightly memory-feedback records + their apply/dismiss op lifecycle.
 _MEMORY_FEEDBACK_DB_PATH = _DB_PATH.parent / "memory_feedback.db"
@@ -847,6 +852,39 @@ async def _persist_side(
 # ---------------------------------------------------------------------------
 
 
+async def _agent_briefing(
+    user_id: str,
+    slug: str,
+    content: str,
+    base_system_prompt: str,
+    *,
+    call_id: str | None,
+) -> prompting.SystemBuildResult:
+    """Build the agent briefing for ``content`` in the ``{user_id}/{slug}`` scope.
+
+    Shared by ``_agent_briefing_hook`` and the read-only briefing preview.
+    Persists a briefing-events row only when ``call_id`` is given; never bumps
+    ``retrieval_count`` (the hook schedules that itself).
+    """
+    agent_id = f"{user_id}/{slug}"
+    return await _build_system(
+        base_system_prompt or None,
+        content,
+        agent_id,
+        backend="anthropic",
+        call_id=call_id,
+        source_agent_id=agent_id,
+    )
+
+
+async def _agent_briefing_preview(user_id: str, slug: str, query: str) -> tuple[str | None, int]:
+    """The briefing ``_agent_briefing_hook`` would inject for ``query``, with no
+    writes: no briefing-events row (no ``call_id``), no ``retrieval_count`` bump.
+    Returns the briefing text and the number of units rendered into it."""
+    result = await _agent_briefing(user_id, slug, query, "", call_id=None)
+    return result.briefing_text, len(result.selected_ids.units) if result.selected_ids else 0
+
+
 async def _agent_briefing_hook(
     user_id: str,
     slug: str,
@@ -873,14 +911,7 @@ async def _agent_briefing_hook(
     """
     agent_id = f"{user_id}/{slug}"
     call_id = f"recordatio-agent-{uuid.uuid4().hex[:12]}"
-    system_result = await _build_system(
-        base_system_prompt or None,
-        content,
-        agent_id,
-        backend="anthropic",
-        call_id=call_id,
-        source_agent_id=agent_id,
-    )
+    system_result = await _agent_briefing(user_id, slug, content, base_system_prompt, call_id=call_id)
     # Off-critical-path: bump retrieval_count for the items that actually made
     # it into the rendered briefing (scoped to the same composite agent_id used
     # for retrieval).
@@ -960,6 +991,12 @@ agent_runner = AgentRunner(
 )
 register_agent_routes(app, runner=agent_runner, config_store=agent_config_store)
 register_user_routes(app, get_store=lambda: store)
+register_agent_memory_routes(
+    app,
+    preview_briefing=_agent_briefing_preview,
+    extract_transcript=_agent_extraction_hook,
+    transcript_log=transcript_log,
+)
 register_feedback_routes(
     app,
     get_store=lambda: store,
