@@ -33,6 +33,45 @@ from tpasini.recordatio.storage.memory_feedback import MemoryFeedbackStore
 
 logger = logging.getLogger(__name__)
 
+# Reversible, low-risk op classes safe to apply without human review: a
+# `tombstone` only sets valid_until (soft delete), and a `merge` only
+# tombstones the duplicates while leaving the canonical untouched. The
+# `correct` class is deliberately excluded — it supersedes content and can be
+# genuinely ambiguous, so it always waits for a human decision.
+_AUTO_APPLY_OP_TYPES = frozenset({"tombstone", "merge"})
+
+
+def _auto_apply_safe_ops(
+    store: SQLiteStore,
+    memory_feedback_store: MemoryFeedbackStore,
+    user_id: str,
+    feedback_id: int,
+) -> dict[str, int]:
+    """Immediately apply the reversible safe-class ops of a freshly recorded
+    feedback record, mirroring the dashboard's ``apply_all_pending`` safety
+    envelope: a malformed op (bad/truncated uuid, out of scope) is auto-rejected
+    via ``InvalidOpError`` and any other ``MemoryOpError`` leaves the op pending.
+    ``correct`` ops and anything that errors are left for human review.
+
+    Returns a small counter summary for the response/logs.
+    """
+    applied = rejected = 0
+    for op in memory_feedback_store.list_ops(feedback_id):
+        if op.status != "pending" or op.op_type not in _AUTO_APPLY_OP_TYPES:
+            continue
+        try:
+            result = apply_memory_op(store, user_id, op.op_type, op.target)
+        except InvalidOpError as exc:
+            memory_feedback_store.mark_op(op.id, status="dismissed", result=f"auto-rejected: {exc}")
+            rejected += 1
+            continue
+        except MemoryOpError:
+            # Transient/non-malformed failure — leave pending for the dashboard.
+            continue
+        memory_feedback_store.mark_op(op.id, status="applied", result=result)
+        applied += 1
+    return {"applied": applied, "rejected": rejected}
+
 
 def _unit_dict(unit: KnowledgeUnit, agent_id: str | None = None) -> dict[str, object]:
     """Serialise a unit for the wire (drops nothing the analyst needs)."""
@@ -76,12 +115,19 @@ def register_feedback_routes(
     get_store: Callable[[], SQLiteStore],
     memory_feedback_store: MemoryFeedbackStore,
     user_label: str,
+    auto_apply_safe_ops: bool = False,
 ) -> None:
     """Register the nightly read + feedback routes on ``app``.
 
     ``get_store`` yields the canonical memory store; ``user_label`` is the
     entity label the production retrieval path is seeded with (same value the
     server passes to ``retrieval.retrieve``).
+
+    When ``auto_apply_safe_ops`` is set, the reversible safe-class ops
+    (tombstone / merge) of each recorded feedback record are applied as soon as
+    the analyst POSTs it, so the op queue is drained automatically instead of
+    waiting for a manual dashboard click. ``correct`` ops are always left
+    pending for human review.
     """
 
     @app.get("/v1/users/{user_id}/units")
@@ -187,7 +233,17 @@ def register_feedback_routes(
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        return JSONResponse({"id": feedback_id})
+        payload: dict[str, object] = {"id": feedback_id}
+        if auto_apply_safe_ops:
+            counts = _auto_apply_safe_ops(get_store(), memory_feedback_store, user_id, feedback_id)
+            payload["auto_applied"] = counts["applied"]
+            payload["auto_rejected"] = counts["rejected"]
+            if counts["applied"] or counts["rejected"]:
+                logger.info(
+                    "auto-applied safe memory-feedback ops for %s/%s: applied=%d rejected=%d",
+                    user_id, day, counts["applied"], counts["rejected"],
+                )
+        return JSONResponse(payload)
 
     @app.get("/v1/users/{user_id}/memory-feedback")
     async def get_memory_feedback(user_id: str, request: Request) -> JSONResponse:
