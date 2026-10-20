@@ -1,10 +1,47 @@
 # Recordatio
 
-Recordatio is a long-term memory layer for LLM agents. It runs as an
-OpenAI-compatible proxy (plus an MCP server): it injects relevant memories into
-each request and extracts new ones from each turn, so agent code needs no
-memory calls. It is for people running their own agents who want memory to work
-without changing agent code.
+**Long-term memory for LLM agents, without changing agent code.**
+
+Recordatio sits between your agent and its model as an OpenAI-compatible proxy. On each request it adds what the agent should remember to the prompt. After each turn it extracts what is worth remembering: facts, events, strategies, people and things. The agent keeps calling `/v1/chat/completions` as before; memory just happens. The same memory is also available as MCP tools.
+
+## Why it exists
+
+Agents forget everything between sessions. The usual fixes all have costs:
+
+- **Stuffing history into the prompt** grows without bound and buries what matters.
+- **Memory tools the agent must call** depend on the model remembering to call them, and need changes to every agent.
+- **A vector store of raw chat** recalls text, not knowledge. It can't tell a fact that changed from one that still holds.
+
+Recordatio's answer:
+
+| Problem | What Recordatio does |
+|---|---|
+| Unbounded context | Each request gets a **briefing** built for that request, within a token budget, not a dump of everything. |
+| Agents must opt in | It works at the **proxy** level, so any OpenAI-compatible client gets memory by setting a header. |
+| Raw text, not knowledge | Each turn is **extracted** into typed units (semantic, episodic, procedural), entities and relations, with provenance. |
+| Stale facts | Every unit has validity dates. A superseded fact is **invalidated, not deleted**, so you can see what was true when. |
+
+## What it looks like
+
+Point any OpenAI-compatible client at Recordatio and give the agent a memory namespace:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8787/v1")
+
+def ask(text):
+    return client.chat.completions.create(
+        model="anthropic/claude-opus-4-6",
+        messages=[{"role": "user", "content": text}],
+        extra_headers={"x-agent-id": "my-agent"},
+    )
+
+ask("We moved the release to Thursday, and the build needs Python 3.13.")
+# ... later, in a brand-new conversation:
+ask("When is the release, and what Python do I need?")
+```
+
+After the first turn, Recordatio extracts facts in the background ("the release is on Thursday", "the build needs Python 3.13"). On the second request it recalls them and adds a `<user_profile>` and `<relevant_memory>` briefing to the system prompt before forwarding. The model answers from memory, with no memory code in the agent.
 
 ```mermaid
 sequenceDiagram
@@ -22,21 +59,9 @@ sequenceDiagram
     X--)S: persist with provenance and validity dates
 ```
 
-The package (`src/tpasini/recordatio/`) also exposes MCP tools, a hosted agent
-runtime and a few dashboards. All of them share the same store:
+## Try it
 
-```mermaid
-flowchart LR
-    C1[OpenAI-compatible clients] -->|/v1/chat/completions| P
-    C2[MCP clients] -->|/mcp/mcp: recollect, extract| P
-    C3[Agent callers] -->|/v1/agents/user/slug/messages| P
-    P[agentmem process] --> DB[(SQLite: units, entities, relations, topics)]
-    P --> UI["/memories /costs /feedback dashboards"]
-```
-
-## Quickstart
-
-Requires Python 3.13.
+You need Python 3.13.
 
 ```bash
 git clone https://github.com/pasinit/recordatio && cd recordatio
@@ -47,25 +72,51 @@ echo 'RECORDATIO_EXTRACTION_MODEL=anthropic/claude-haiku-4-5-20251001' > .env
 make run                      # same as: agentmem --port 8787
 ```
 
+Then run the example above. Your client's `Authorization: Bearer` token is forwarded upstream. Open `http://localhost:8787/memories` to browse what was extracted.
+
 > One runtime dependency, a provider-routing library, is installed from a
 > private Git repository (see `requirements.in`). A fresh install fails without
 > access to it.
 
-Point an OpenAI-compatible client at the proxy and pick a memory namespace:
+## How it's built
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8787/v1")
-client.chat.completions.create(
-    model="anthropic/claude-opus-4-6",
-    messages=[{"role": "user", "content": "Hi"}],
-    extra_headers={"x-agent-id": "my-agent"},
-)
+One process (`agentmem`) serves the proxy, the MCP tools, a hosted agent runtime and a few dashboards, all over one SQLite store:
+
+```mermaid
+flowchart LR
+    C1[OpenAI-compatible clients] -->|/v1/chat/completions| P
+    C2[MCP clients] -->|/mcp/mcp: recollect, extract| P
+    C3[Agent callers] -->|/v1/agents/user/slug/messages| P
+    P[agentmem process] --> DB[(SQLite: units, entities, relations, topics)]
+    P --> UI["/memories /costs /feedback dashboards"]
 ```
 
-The client's `Authorization: Bearer` token is forwarded upstream.
+- **Briefing.** Candidates are retrieved and reranked for the current request, then fitted into a token budget.
+- **Extraction.** It runs in the background after the response has streamed, so it adds no latency to the agent.
+- **Model routing.** `provider/model` picks the backend (Anthropic, OpenAI-compatible, Ollama, LM Studio, Gemini), for both the agent's requests and extraction.
 
-## Model routing
+The code is in `src/tpasini/recordatio/`:
+- `proxy`: the HTTP routes, briefing, retrieval and MCP server;
+- `extraction`: the extractor and its prompt;
+- `storage`: the SQLite store;
+- `agents`: the hosted agent runtime;
+- `ui`: the dashboards.
+
+## Reference
+
+### Knowledge model
+
+| Type | What | Example |
+|------|------|---------|
+| Semantic | Durable facts | "The project targets Python 3.13" |
+| Episodic | Specific events | "Compared two reports and found three changes" |
+| Procedural | Learned strategies | "Check the cache before re-fetching filings" |
+
+Every unit carries `asserted_at`, `valid_from` and `valid_until`. Superseded
+facts are invalidated, not deleted. Retrieval depends on the request, so each
+briefing is built from the current task rather than dumped wholesale.
+
+### Model routing
 
 The `model` field uses `provider/model`. The prefix picks the backend:
 
@@ -78,7 +129,7 @@ The `model` field uses `provider/model`. The prefix picks the backend:
 | `gemini/` | OpenAI-compatible | Google's OpenAI-compatible endpoint |
 | `codex/` | Codex CLI (ChatGPT subscription), extraction only | none |
 
-## Request controls
+### Request controls
 
 Recordatio strips these before forwarding upstream.
 
@@ -95,7 +146,7 @@ When memories are recalled, a streamed response begins with a named SSE event,
 `event: agentmem.briefing`, that lists the recalled units, entities and
 relations. Standard clients ignore it.
 
-## MCP
+### MCP
 
 The same process serves MCP (Streamable HTTP) at `http://localhost:8787/mcp/mcp`
 with two tools: `recollect(query)` and `extract(messages, response_text,
@@ -110,7 +161,7 @@ operator configures, never from a tool argument:
 Optional headers: `X-Recordatio-Api-Key` (extraction key override) and
 `X-User-Id` (tags cost-log rows).
 
-## HTTP routes
+### HTTP routes
 
 | Route | Purpose |
 |-------|---------|
@@ -122,7 +173,7 @@ Optional headers: `X-Recordatio-Api-Key` (extraction key override) and
 | `GET /memories`, `/costs`, `/feedback` | Dashboards (knowledge graph, extraction cost, feedback review) |
 | `GET /health` | Liveness check |
 
-## Configuration
+### Configuration
 
 Set environment variables, or put them in `.env`. `make run` loads that file.
 
@@ -145,30 +196,16 @@ To backfill an existing store into the ontology tables, run
 `agentmem-backfill --db <path> --agent-id <id>`. It is a dry run by default.
 Pass `--apply --enable-ontology-apply` to write; this takes a backup first.
 
-## Knowledge model
+## Contributing
 
-| Type | What | Example |
-|------|------|---------|
-| Semantic | Durable facts | "The project targets Python 3.13" |
-| Episodic | Specific events | "Compared two reports and found three changes" |
-| Procedural | Learned strategies | "Check the cache before re-fetching filings" |
+| Command | What it does |
+|---|---|
+| `make install` | Install the package and dev dependencies |
+| `make test` | Run the tests |
+| `make lint` / `make fix-lint` | Ruff check / fix and format |
+| `make compile` | Re-pin requirements after editing `*.in` |
 
-Every unit carries `asserted_at`, `valid_from` and `valid_until`. Superseded
-facts are invalidated, not deleted. Retrieval depends on the request, so each
-briefing is built from the current task rather than dumped wholesale.
-
-## Development
-
-```bash
-make install    # pip install -r requirements-dev.txt -e .
-make test       # pytest
-make lint       # ruff check
-make fix-lint   # ruff --fix + ruff format
-make compile    # re-pin requirements after editing *.in
-```
-
-A `Dockerfile` is included. It serves on port 8787 and needs a `GITHUB_TOKEN`
-build arg for the private dependency.
+A `Dockerfile` is included. It serves on port 8787 and needs a `GITHUB_TOKEN` build arg for the private dependency.
 
 ## License
 
