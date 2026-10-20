@@ -2,11 +2,12 @@
 
 Recordatio's HTTP API treats any presented API key as a pass-through
 credential, which is safe only while every caller is local (loopback or the
-Compose network). This guard lets a remote host search memories and nothing
+Compose network). This guard lets a remote host read memories and nothing
 else:
 
 * A **recall key** (configured by SHA-256 hash, never in plain text) may call
-  only ``GET /v1/users/{user_id}/memory-search``, from anywhere.
+  only ``GET /v1/users/{user_id}/memory-search`` and
+  ``GET /v1/users/{user_id}/briefing``, from anywhere.
 * A request from a **restricted network** (CIDRs, e.g. a private VPC) must
   present a recall key; anything else from there is refused.
 
@@ -23,7 +24,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-RECALL_PATH = re.compile(r"^/v1/users/[^/]+/memory-search$")
+RECALL_PATH = re.compile(r"^/v1/users/[^/]+/(?:memory-search|briefing)$")
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -46,7 +47,8 @@ def decide(client_host: str | None, method: str, path: str, api_key: str | None,
     """Return an HTTP status to refuse the request with, or ``None`` to let it through.
 
     ``401``: a restricted-network caller without a recall key.
-    ``403``: a recall key (or restricted caller) asking for anything but memory search.
+    ``403``: a recall key (or restricted caller) asking for anything but memory search
+    or a briefing preview.
     """
     recall = is_recall_key(api_key, key_hashes)
     restricted = False
@@ -87,6 +89,6 @@ def install(app: FastAPI, restricted_networks: Iterable[str], recall_key_hashes:
         client = request.client.host if request.client else None
         status = decide(client, request.method, request.url.path, _api_key(request), networks, hashes)
         if status is not None:
-            error = "unauthorized" if status == 401 else "forbidden: this key may only search memories"
+            error = "unauthorized" if status == 401 else "forbidden: this key may only read memories"
             return JSONResponse({"error": error}, status_code=status)
         return await call_next(request)
