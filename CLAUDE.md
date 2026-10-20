@@ -2,7 +2,7 @@
 
 ## Project
 
-agentmem is an HTTP proxy that sits between an agent and the Anthropic API. It injects relevant knowledge into system prompts (briefing), observes responses, extracts typed knowledge units (semantic, episodic, procedural), and consolidates them over time. See README.md for the full architecture.
+Recordatio (CLI: `agentmem`) is an OpenAI-compatible LLM proxy and MCP server that gives agents long-term memory. It injects relevant memories into requests (briefing) and extracts typed knowledge (semantic, episodic, procedural units, plus entities and relations) from each turn. It also hosts an agent runtime (Claude or Codex subscription). See README.md.
 
 The package lives at `src/tpasini/recordatio/`.
 
@@ -26,8 +26,7 @@ Write idiomatic Python 3.13. Concretely:
 # set up
 python3.13 -m venv .venv
 .venv/bin/pip install pip-tools
-make compile
-.venv/bin/pip install -r requirements-dev.txt -e .
+make install
 
 # daily workflow
 make lint
