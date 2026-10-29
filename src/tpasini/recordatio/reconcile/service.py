@@ -210,7 +210,7 @@ class ReconcileService:
 
         def fresh(p: Pair) -> bool:
             key = frozenset((p.a.id, p.b.id))
-            if key in seen or {p.a.id, p.b.id} & exact_drops:
+            if p.a.id == p.b.id or key in seen or {p.a.id, p.b.id} & exact_drops:
                 return False
             seen.add(key)
             return True
@@ -376,6 +376,9 @@ class ReconcileService:
         if match is None:
             raise ReconcileError("malformed pair_token")
         a_id, b_id, want, op_raw = match.group(1), match.group(2), match.group(3), int(match.group(4))
+        if a_id == b_id:
+            # A unit can never be redundant "in favour of" itself.
+            raise ReconcileError("malformed pair_token: both sides name the same unit")
         try:
             parsed = parse_verdict(verdict)
         except ValueError as exc:

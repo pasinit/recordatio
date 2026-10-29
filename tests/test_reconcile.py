@@ -235,6 +235,45 @@ def test_stale_pair_token_is_refused(store: SQLiteStore) -> None:
     assert drop.id in _units(store)
 
 
+def test_self_pair_token_is_refused(store: SQLiteStore) -> None:
+    unit = _unit("Sam lives in Springfield")
+    store.add(unit, SCOPE)
+    svc = _service(store)
+    forged = f"{unit.id}~{unit.id}~-~0~{'0' * 32}"
+    same = {"relation": "duplicate_subsumed", "keep": "A", "drop": "B", "facts": [
+        {"dropped_fact": unit.content, "kept_span": unit.content, "status": "same"}]}
+
+    with pytest.raises(ReconcileError, match="same unit"):
+        svc.apply("sam", RUN, forged, same)
+    assert unit.id in _units(store)
+
+
+def test_candidates_never_pair_a_unit_with_itself(store: SQLiteStore, feedback: MemoryFeedbackStore) -> None:
+    units = [_unit(f"Sam likes Springfield park number {i}", at=T0 + timedelta(hours=i)) for i in range(5)]
+    for u in units[:3]:
+        store.add(u, USER_SCOPE)
+    for u in units[3:]:
+        store.add(u, AGENT_SCOPE)
+    vec = embeddings.pack_embedding([1.0, 0.0, 0.0, 0.0])
+    for u in units:
+        scope = USER_SCOPE if u in units[:3] else AGENT_SCOPE
+        store.upsert_item_embedding(item_id=u.id, agent_id=scope, kind="unit", surface_hash=u.id,
+                                    embedding=vec, model="m", asserted_at=T0.isoformat())
+    # Ops naming the same unit twice must not produce a self-pair either.
+    feedback.record(user_id="sam", day="2026-09-02", summary="s", findings=[], ops=[
+        {"op_type": "merge", "target": {"canonical_id": units[0].id, "duplicate_ids": [units[0].id, units[1].id]},
+         "reason": "m"},
+        {"op_type": "tombstone", "target": {"unit_id": units[3].id}, "reason": "t"},
+    ])
+    svc = _service(store, feedback)
+
+    pairs = svc.candidates("sam", RUN, limit=25)["pairs"]
+
+    assert pairs
+    assert all(p["a"]["id"] != p["b"]["id"] for p in pairs)
+    assert all(len(set(p["pair_token"].split("~")[:2])) == 2 for p in pairs)
+
+
 def test_never_crosses_users(store: SQLiteStore) -> None:
     mine = _unit("Sam lives in Springfield")
     theirs = _unit("Sam lives in Springfield", at=T0 + timedelta(days=1))
