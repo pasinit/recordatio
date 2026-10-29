@@ -179,6 +179,7 @@ def test_contradiction_with_newer_claim_deletes_older(store: SQLiteStore) -> Non
 
     assert _units(store) == {new.id: new.content}
     assert report["users"]["sam"]["by_relation"] == {"supersedes": 1}
+    assert report["totals"]["by_relation"] == {"supersedes": 1}
 
 
 def test_contradiction_where_kept_is_actually_older_deletes_nothing(store: SQLiteStore) -> None:

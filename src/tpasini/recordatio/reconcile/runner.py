@@ -507,6 +507,7 @@ class Reconciler:
     ) -> dict[str, Any]:
         users: dict[str, Any] = {}
         totals: Counter = Counter()
+        totals_by_relation: Counter = Counter()
         deletions: list[dict[str, Any]] = []
         ops: list[dict[str, Any]] = []
         total_cost = 0.0
@@ -525,6 +526,7 @@ class Reconciler:
                 "judge_cost_usd": round(up.cost_usd, 6),
             }
             totals.update(stats)
+            totals_by_relation.update(by_relation)
             total_cost += up.cost_usd
             for d in planned:
                 deletions.append({
@@ -550,7 +552,11 @@ class Reconciler:
             "finished_at": datetime.now(UTC).isoformat(),
             "snapshot": snapshot,
             "vacuumed": vacuumed,
-            "totals": {**dict(sorted(totals.items())), "judge_cost_usd": round(total_cost, 6)},
+            "totals": {
+                **dict(sorted(totals.items())),
+                "by_relation": dict(totals_by_relation),
+                "judge_cost_usd": round(total_cost, 6),
+            },
             "users": users,
             "deletions": deletions,
             "ops": ops,
