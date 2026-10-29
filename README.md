@@ -169,6 +169,7 @@ Optional headers: `X-Recordatio-Api-Key` (extraction key override) and
 | `POST /v1/agents/{user_id}/{slug}/messages` | Run a hosted agent (Claude Agent SDK or Codex subscription), streamed as SSE |
 | `GET/PUT /v1/agents/{user_id}/{slug}/config` | Hosted agent configuration |
 | `GET /v1/users/{user_id}/memory-search`, `/units`, `/memory-feedback` | Memory search and user feedback |
+| `POST /v1/memory-reconcile`, `/v1/users/{user_id}/memory-reconcile` | Nightly reconcile/compaction (`?dry_run=true` to preview) |
 | `GET /v1/briefing-events[/{request_id}]` | What was injected, per request |
 | `GET /memories`, `/costs`, `/feedback` | Dashboards (knowledge graph, extraction cost, feedback review) |
 | `GET /health` | Liveness check |
@@ -195,6 +196,23 @@ read, in `src/tpasini/recordatio/proxy/`.
 To backfill an existing store into the ontology tables, run
 `agentmem-backfill --db <path> --agent-id <id>`. It is a dry run by default.
 Pass `--apply --enable-ontology-apply` to write; this takes a backup first.
+
+### Memory reconcile
+
+`agentmem reconcile [--user ID] [--dry-run] [--output report.json]` (or the
+`memory-reconcile` routes) physically deletes memories that are superseded:
+duplicates whose every fact a kept memory states, and older claims a newer
+memory in the same scope replaces. It never writes memory text. An LLM judge
+(`RECORDATIO_RECONCILE_MODEL`, default the extraction model) returns
+structured verdicts with verbatim quotes, and code checks the quotes before
+anything is deleted. When in doubt, it keeps both. Pending memory-feedback ops
+go through the same checks: passing tombstone and merge ops are applied as
+deletions, failing ones are dismissed, and `correct` ops are always dismissed.
+A real run snapshots the store first (the last `RECORDATIO_RECONCILE_SNAPSHOT_KEEP`
+are kept, default 7), writes one audit row per deletion to
+`memory_reconcile.db`, then runs VACUUM. `--dry-run` writes nothing. Limits
+are set by `RECORDATIO_RECONCILE_*` variables; see
+`src/tpasini/recordatio/reconcile/settings.py`.
 
 ## Contributing
 

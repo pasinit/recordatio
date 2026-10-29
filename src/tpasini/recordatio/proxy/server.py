@@ -62,6 +62,7 @@ from tpasini.recordatio.proxy.cost_log import CostLog
 from tpasini.recordatio.proxy.dashboard_routes import register_dashboard_routes
 from tpasini.recordatio.proxy.feedback_endpoints import register_feedback_routes
 from tpasini.recordatio.proxy.pricing import lookup_cost as _lookup_cost
+from tpasini.recordatio.proxy.reconcile_routes import register_reconcile_routes
 from tpasini.recordatio.proxy.runtime import (
     ExtractionUsageBuffer,
     Settings,
@@ -1003,6 +1004,7 @@ register_feedback_routes(
     memory_feedback_store=memory_feedback_store,
     user_label=_USER_ENTITY_LABEL,
 )
+register_reconcile_routes(app, get_store=lambda: store, memory_feedback_store=memory_feedback_store)
 
 
 async def _close_agent_warm_pool() -> None:
