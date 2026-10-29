@@ -169,7 +169,7 @@ Optional headers: `X-Recordatio-Api-Key` (extraction key override) and
 | `POST /v1/agents/{user_id}/{slug}/messages` | Run a hosted agent (Claude Agent SDK or Codex subscription), streamed as SSE |
 | `GET/PUT /v1/agents/{user_id}/{slug}/config` | Hosted agent configuration |
 | `GET /v1/users/{user_id}/memory-search`, `/units`, `/memory-feedback` | Memory search and user feedback |
-| `POST /v1/memory-reconcile`, `/v1/users/{user_id}/memory-reconcile` | Nightly reconcile/compaction (`?dry_run=true` to preview) |
+| `/v1/users/{user_id}/memory-reconcile/{candidates,verdicts,runs}` | Memory reconcile driven by a judge agent (see below) |
 | `GET /v1/briefing-events[/{request_id}]` | What was injected, per request |
 | `GET /memories`, `/costs`, `/feedback` | Dashboards (knowledge graph, extraction cost, feedback review) |
 | `GET /health` | Liveness check |
@@ -186,6 +186,7 @@ Set environment variables, or put them in `.env`. `make run` loads that file.
 | `RECORDATIO_SUBSCRIPTION_PROVIDER` | `claude` | Hosted agent runtime: `claude` or `codex` (see [CODEX_MIGRATION.md](CODEX_MIGRATION.md)) |
 | `RECORDATIO_MCP_ALLOWED_HOSTS` | loopback, `recordatio:8787` | JSON array of trusted `Host` values for MCP |
 | `RECORDATIO_RESTRICTED_NETWORKS`, `RECORDATIO_RECALL_KEY_SHA256` | empty | JSON arrays. Callers from these CIDRs need a recall key, which can only call `memory-search`. |
+| `RECORDATIO_RECONCILE_KEY_SHA256` | empty | JSON array. A reconcile key can call only the `memory-reconcile` routes, also from the restricted CIDRs. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | empty (off) | OpenTelemetry OTLP/gRPC endpoint |
 | `OTEL_SERVICE_NAME` | `recordatio` | Trace service name |
 
@@ -199,20 +200,38 @@ Pass `--apply --enable-ontology-apply` to write; this takes a backup first.
 
 ### Memory reconcile
 
-`agentmem reconcile [--user ID] [--dry-run] [--output report.json]` (or the
-`memory-reconcile` routes) physically deletes memories that are superseded:
-duplicates whose every fact a kept memory states, and older claims a newer
-memory in the same scope replaces. It never writes memory text. An LLM judge
-(`RECORDATIO_RECONCILE_MODEL`, default the extraction model) returns
-structured verdicts with verbatim quotes, and code checks the quotes before
-anything is deleted. When in doubt, it keeps both. Pending memory-feedback ops
-go through the same checks: passing tombstone and merge ops are applied as
-deletions, failing ones are dismissed, and `correct` ops are always dismissed.
-A real run snapshots the store first (the last `RECORDATIO_RECONCILE_SNAPSHOT_KEEP`
-are kept, default 7), writes one audit row per deletion to
-`memory_reconcile.db`, then runs VACUUM. `--dry-run` writes nothing. Limits
-are set by `RECORDATIO_RECONCILE_*` variables; see
+The reconcile physically deletes memories that are superseded:
+- duplicates whose every fact a kept memory states;
+- older claims that a newer memory replaces.
+
+It never writes memory text. Recordatio does not call a model for it. A judge
+agent (in production, a nightly Cardea routine) loops over three calls:
+1. `GET …/memory-reconcile/candidates?run_id=…` returns pairs of memories, each
+   with a `pair_token`.
+2. `POST …/memory-reconcile/verdicts` submits a structured verdict quoting both
+   memories verbatim. Recordatio checks the quotes and the token against the
+   live store, and deletes only if every check passes. A replayed token
+   returns the first outcome.
+3. `POST …/memory-reconcile/runs/{run_id}/finish` removes exact duplicates and
+   memories a human-approved correction already replaced. It also settles the
+   pending memory-feedback ops, then runs VACUUM.
+
+When in doubt, both memories are kept. Pairs stay within one scope, or pair a
+user's shared scope with one of their agent scopes; in that case only the agent
+copy can be deleted. The first deletion of a run snapshots the store (the last
+`RECORDATIO_RECONCILE_SNAPSHOT_KEEP` are kept, default 7). Every deletion is
+audited in `memory_reconcile.db`. `dry_run` verifies without changing anything.
+Limits are set by `RECORDATIO_RECONCILE_*`; see
 `src/tpasini/recordatio/reconcile/settings.py`.
+
+To try the judging rules on a copy of a store, run the same loop locally with
+any command that reads a prompt on stdin. It is a dry run unless you pass
+`--apply`:
+
+```sh
+AGENTMEM_DB=/copy/memories.db agentmem reconcile \
+  --judge-cmd 'claude -p' --judge-prompt memory_reconcile_rules.md --output report.json
+```
 
 ## Contributing
 

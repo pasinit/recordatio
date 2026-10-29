@@ -9,8 +9,10 @@ own except exact duplicates:
    (no model load) — the focus units against every active unit;
 3. FTS/BM25 neighbours of each focus unit's content words.
 
-Pairs are always same-scope and same-type: a unit in one agent's scope is
-never dropped because another scope holds a similar one.
+Pairs are always same-type and same-user. Across scopes, only the user's
+shared scope (``{user}/_user``) pairs with each of that user's agent scopes,
+and the shared copy is the one that may be kept (enforced again at apply).
+Two agent scopes never pair with each other.
 """
 import hashlib
 import re
@@ -50,7 +52,9 @@ class CandidatePair:
 @dataclass(frozen=True)
 class ExactDuplicate:
     keep: KnowledgeUnit
+    keep_scope: str
     drop: KnowledgeUnit
+    drop_scope: str
 
 
 def _exact_keep_order(u: KnowledgeUnit) -> tuple[int, object, str]:
@@ -59,80 +63,109 @@ def _exact_keep_order(u: KnowledgeUnit) -> tuple[int, object, str]:
     return (-(u.extraction_count + u.retrieval_count), recency(u)[1], u.id)
 
 
-def exact_duplicates(units: list[KnowledgeUnit]) -> list[ExactDuplicate]:
-    """Same-type units with identical normalised text. Episodic units only
-    group within the same valid_from day (the same event recorded twice);
-    the same text on another day is another event."""
-    groups: dict[tuple[str, str, str], list[KnowledgeUnit]] = defaultdict(list)
-    for u in units:
-        norm = normalise_content(u.content)
-        if not norm:
-            continue
-        day = recency(u)[0].date().isoformat() if u.type is KnowledgeType.EPISODIC else ""
-        groups[(u.type.value, day, norm)].append(u)
+def exact_key(u: KnowledgeUnit) -> tuple[str, str, str] | None:
+    """Grouping key for identical text. Episodic units only group within the
+    same valid_from day (the same event recorded twice); the same text on
+    another day is another event."""
+    norm = normalise_content(u.content)
+    if not norm:
+        return None
+    day = recency(u)[0].date().isoformat() if u.type is KnowledgeType.EPISODIC else ""
+    return (u.type.value, day, norm)
+
+
+def exact_duplicates(scoped: list[tuple[KnowledgeUnit, str]], user_scope: str) -> list[ExactDuplicate]:
+    """Units with identical normalised text, resolved without a judge.
+
+    A group holding a copy in ``user_scope`` keeps the best shared copy and
+    drops every other member (shared or agent-scoped). Otherwise each scope
+    keeps its own best copy: two agent scopes never resolve against each other.
+    """
+    groups: dict[tuple[str, str, str], list[tuple[KnowledgeUnit, str]]] = defaultdict(list)
+    for u, scope in scoped:
+        if (key := exact_key(u)) is not None:
+            groups[key].append((u, scope))
     out: list[ExactDuplicate] = []
     for members in groups.values():
         if len(members) < 2:
             continue
-        ordered = sorted(members, key=_exact_keep_order)
-        out.extend(ExactDuplicate(keep=ordered[0], drop=other) for other in ordered[1:])
+        shared = sorted((m for m in members if m[1] == user_scope), key=lambda m: _exact_keep_order(m[0]))
+        if shared:
+            keep, keep_scope = shared[0]
+            out.extend(
+                ExactDuplicate(keep=keep, keep_scope=keep_scope, drop=u, drop_scope=scope)
+                for u, scope in members if u.id != keep.id
+            )
+            continue
+        by_scope: dict[str, list[KnowledgeUnit]] = defaultdict(list)
+        for u, scope in members:
+            by_scope[scope].append(u)
+        for scope, units in by_scope.items():
+            ordered = sorted(units, key=_exact_keep_order)
+            out.extend(ExactDuplicate(keep=ordered[0], keep_scope=scope, drop=u, drop_scope=scope) for u in ordered[1:])
     return out
 
 
 def _embedding_pairs(
     store: SQLiteStore,
-    agent_id: str,
-    units: dict[str, KnowledgeUnit],
     focus: list[KnowledgeUnit],
+    focus_scope: str,
+    pool: dict[str, KnowledgeUnit],
+    pool_scope: str,
     threshold: float,
 ) -> list[CandidatePair]:
-    blobs = store.scope_unit_embeddings(agent_id, list(units))
-    focus_ids = [u.id for u in focus if u.id in blobs]
-    if not focus_ids or len(blobs) < 2:
+    focus_blobs = store.scope_unit_embeddings(focus_scope, [u.id for u in focus])
+    pool_blobs = store.scope_unit_embeddings(pool_scope, list(pool))
+    if not focus_blobs or not pool_blobs:
         return []
     import numpy as np
 
-    ids = list(blobs)
-    mat = np.stack([np.frombuffer(blobs[i], dtype="<f4") for i in ids]).astype(np.float32)
-    norms = np.linalg.norm(mat, axis=1)
-    norms[norms == 0.0] = 1.0
-    mat = mat / norms[:, None]
-    index = {iid: n for n, iid in enumerate(ids)}
-    sims = mat[[index[i] for i in focus_ids]] @ mat.T
+    def matrix(blobs: dict[str, bytes]) -> tuple[list[str], np.ndarray]:
+        ids = list(blobs)
+        mat = np.stack([np.frombuffer(blobs[i], dtype="<f4") for i in ids]).astype(np.float32)
+        norms = np.linalg.norm(mat, axis=1)
+        norms[norms == 0.0] = 1.0
+        return ids, mat / norms[:, None]
+
+    focus_ids, fmat = matrix(focus_blobs)
+    pool_ids, pmat = matrix(pool_blobs)
+    by_id = {u.id: u for u in focus}
+    sims = fmat @ pmat.T
     out: list[CandidatePair] = []
     for row, fid in enumerate(focus_ids):
         for col in np.nonzero(sims[row] >= threshold)[0]:
-            other = ids[int(col)]
-            if other == fid or units[other].type is not units[fid].type:
+            other = pool[pool_ids[int(col)]]
+            if other.id == fid or other.type is not by_id[fid].type:
                 continue
-            out.append(CandidatePair(a=units[fid], b=units[other], signal="embedding", score=float(sims[row, col])))
+            out.append(CandidatePair(a=by_id[fid], b=other, signal="embedding", score=float(sims[row, col])))
     return out
 
 
 def candidate_pairs(
     store: SQLiteStore,
-    agent_id: str,
-    units: list[KnowledgeUnit],
     focus: list[KnowledgeUnit],
+    pool: list[KnowledgeUnit],
     *,
+    focus_scope: str,
+    pool_scope: str,
     cosine_threshold: float,
     fts_neighbours: int,
     exclude: set[str] | None = None,
 ) -> list[CandidatePair]:
-    """Deduplicated candidate pairs touching ``focus``, best first.
+    """Deduplicated pairs (focus unit, pool unit), best first.
 
-    Embedding pairs rank by cosine (desc); FTS-only pairs follow in BM25
-    rank order. Units in ``exclude`` (already resolved this run) never pair.
+    ``focus_scope == pool_scope`` pairs within one scope; otherwise across two
+    scopes of the same user. Embedding pairs rank by cosine (desc); FTS-only
+    pairs follow in BM25 rank order. Units in ``exclude`` never pair.
     """
     exclude = exclude or set()
-    by_id = {u.id: u for u in units if u.id not in exclude}
-    focus = [u for u in focus if u.id in by_id]
+    by_id = {u.id: u for u in pool if u.id not in exclude}
+    focus = [u for u in focus if u.id not in exclude]
     seen: set[frozenset[str]] = set()
     out: list[CandidatePair] = []
 
-    for p in sorted(
-        _embedding_pairs(store, agent_id, by_id, focus, cosine_threshold), key=lambda p: (-p.score, p.a.id, p.b.id)
-    ):
+    embedded = _embedding_pairs(store, focus, focus_scope, by_id, pool_scope, cosine_threshold)
+    for p in sorted(embedded, key=lambda p: (-p.score, p.a.id, p.b.id)):
         key = frozenset((p.a.id, p.b.id))
         if key not in seen:
             seen.add(key)
@@ -140,7 +173,7 @@ def candidate_pairs(
 
     fts_pairs: list[CandidatePair] = []
     for u in focus:
-        for rank, other_id in enumerate(store.fts_unit_neighbours(u.content, agent_id, fts_neighbours + 1)):
+        for rank, other_id in enumerate(store.fts_unit_neighbours(u.content, pool_scope, fts_neighbours + 1)):
             other = by_id.get(other_id)
             if other is None or other.id == u.id or other.type is not u.type:
                 continue
@@ -159,6 +192,7 @@ __all__ = [
     "candidate_pairs",
     "content_hash",
     "exact_duplicates",
+    "exact_key",
     "normalise_content",
     "pair_key",
 ]

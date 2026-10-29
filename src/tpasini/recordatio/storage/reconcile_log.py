@@ -1,20 +1,24 @@
-"""Durable audit + incremental state for the nightly memory reconcile.
+"""Durable audit + run state for the memory reconcile.
 
 Kept in its own sidecar DB (``memory_reconcile.db``, like
 ``memory_feedback.db``) so the canonical memory DB never grows schema for
 it — a new table there would change a frozen artifact's bytes on open.
 
 Tables:
-- ``reconcile_run``      — one row per run (applied runs only; a dry run
-  writes nothing anywhere) with its JSON summary and snapshot path.
+- ``reconcile_run``      — one row per (user, run id) once the run first
+  mutates: snapshot path, finish time and the finish summary. Dry runs write
+  nothing anywhere.
+- ``reconcile_verdict``  — the recorded outcome of every submitted verdict,
+  keyed by (user, pair token). A replayed token returns this row and never
+  has a second effect.
 - ``reconcile_deletion`` — one row per physically deleted unit: who kept it,
   why (relation + judge evidence), which run, when. The only surviving
   trace of a deleted unit outside the retained snapshots.
 - ``reconcile_cursor``   — per-scope incremental cursors: the highest rowid
   already scanned as "new", and the rolling slice position over older rows.
-- ``reconcile_judged``   — verdict cache for pairs the judge said must be
-  kept (unrelated / compatible / unsure / unverified), keyed by both units'
-  id + content, so a stable store is not re-judged every night.
+- ``reconcile_judged``   — verdict cache for pairs that must be kept
+  (unrelated / compatible / unsure / rejected), keyed by both units' id +
+  content, so a stable store is not re-judged every night.
 """
 import json
 import sqlite3
@@ -43,8 +47,18 @@ class ScopeCursor:
     rolling_after: int  # the rolling slice over older rows resumes after this rowid
 
 
+@dataclass(frozen=True)
+class RunRow:
+    run_id: str
+    user_id: str
+    started_at: str
+    finished_at: str | None
+    snapshot_path: str | None
+    summary: dict[str, Any] | None
+
+
 class ReconcileLog:
-    """SQLite-backed audit/cursor store for the reconcile job."""
+    """SQLite-backed audit/run store for the reconcile service."""
 
     def __init__(self, db_path: Path) -> None:
         # Same threading model as the other sidecar stores (memory_feedback,
@@ -58,13 +72,29 @@ class ReconcileLog:
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS reconcile_run (
-                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
                 started_at TEXT NOT NULL,
                 finished_at TEXT,
-                scope TEXT NOT NULL,
                 snapshot_path TEXT,
-                summary_json TEXT
+                summary_json TEXT,
+                PRIMARY KEY (user_id, run_id)
             );
+            CREATE TABLE IF NOT EXISTS reconcile_verdict (
+                user_id TEXT NOT NULL,
+                pair_token TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                op_id INTEGER,
+                outcome TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                kept_unit_id TEXT,
+                dropped_unit_id TEXT,
+                decided_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, pair_token)
+            );
+            CREATE INDEX IF NOT EXISTS reconcile_verdict_run ON reconcile_verdict(user_id, run_id);
+            CREATE INDEX IF NOT EXISTS reconcile_verdict_op ON reconcile_verdict(op_id);
             CREATE TABLE IF NOT EXISTS reconcile_deletion (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
@@ -94,23 +124,93 @@ class ReconcileLog:
         )
         self._conn.commit()
 
-    def start_run(self, run_id: str, scope: str) -> None:
+    # -- runs ---------------------------------------------------------------
+
+    def get_run(self, user_id: str, run_id: str) -> RunRow | None:
+        row = self._conn.execute(
+            "SELECT * FROM reconcile_run WHERE user_id = ? AND run_id = ?", (user_id, run_id)
+        ).fetchone()
+        if row is None:
+            return None
+        return RunRow(
+            run_id=row["run_id"],
+            user_id=row["user_id"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+            snapshot_path=row["snapshot_path"],
+            summary=json.loads(row["summary_json"]) if row["summary_json"] else None,
+        )
+
+    def ensure_run(self, user_id: str, run_id: str) -> RunRow:
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO reconcile_run (id, started_at, scope) VALUES (?, ?, ?)",
-                (run_id, datetime.now(UTC).isoformat(), scope),
+                "INSERT OR IGNORE INTO reconcile_run (run_id, user_id, started_at) VALUES (?, ?, ?)",
+                (run_id, user_id, datetime.now(UTC).isoformat()),
             )
+        run = self.get_run(user_id, run_id)
+        assert run is not None
+        return run
 
-    def set_snapshot(self, run_id: str, path: str) -> None:
-        with self._lock, self._conn:
-            self._conn.execute("UPDATE reconcile_run SET snapshot_path = ? WHERE id = ?", (path, run_id))
-
-    def finish_run(self, run_id: str, summary: dict[str, Any]) -> None:
+    def set_snapshot(self, user_id: str, run_id: str, path: str) -> None:
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE reconcile_run SET finished_at = ?, summary_json = ? WHERE id = ?",
-                (datetime.now(UTC).isoformat(), json.dumps(summary, sort_keys=True), run_id),
+                "UPDATE reconcile_run SET snapshot_path = ? WHERE user_id = ? AND run_id = ?", (path, user_id, run_id)
             )
+
+    def finish_run(self, user_id: str, run_id: str, summary: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE reconcile_run SET finished_at = ?, summary_json = ? WHERE user_id = ? AND run_id = ?",
+                (datetime.now(UTC).isoformat(), json.dumps(summary, sort_keys=True), user_id, run_id),
+            )
+
+    def runs(self) -> list[RunRow]:
+        rows = self._conn.execute("SELECT user_id, run_id FROM reconcile_run ORDER BY started_at").fetchall()
+        return [r for r in (self.get_run(row["user_id"], row["run_id"]) for row in rows) if r is not None]
+
+    # -- verdicts -----------------------------------------------------------
+
+    def get_verdict(self, user_id: str, pair_token: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM reconcile_verdict WHERE user_id = ? AND pair_token = ?", (user_id, pair_token)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def record_verdict(
+        self,
+        *,
+        user_id: str,
+        pair_token: str,
+        run_id: str,
+        op_id: int | None,
+        outcome: str,
+        relation: str,
+        reason: str,
+        kept_unit_id: str | None,
+        dropped_unit_id: str | None,
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO reconcile_verdict (user_id, pair_token, run_id, op_id, outcome, relation, "
+                "reason, kept_unit_id, dropped_unit_id, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, pair_token, run_id, op_id, outcome, relation, reason, kept_unit_id, dropped_unit_id,
+                 datetime.now(UTC).isoformat()),
+            )
+
+    def run_verdicts(self, user_id: str, run_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM reconcile_verdict WHERE user_id = ? AND run_id = ? ORDER BY decided_at",
+            (user_id, run_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def op_verdicts(self, user_id: str, op_id: int) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM reconcile_verdict WHERE user_id = ? AND op_id = ? ORDER BY decided_at", (user_id, op_id)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- deletions ----------------------------------------------------------
 
     def record_deletion(self, rec: DeletionRecord) -> None:
         with self._lock, self._conn:
@@ -130,18 +230,19 @@ class ReconcileLog:
                 ),
             )
 
-    def deletions(self, run_id: str | None = None) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM reconcile_deletion"
-        params: tuple[object, ...] = ()
+    def deletions(self, run_id: str | None = None, *, unit_id: str | None = None) -> list[dict[str, Any]]:
+        clauses, params = [], []
         if run_id is not None:
-            sql += " WHERE run_id = ?"
-            params = (run_id,)
-        rows = self._conn.execute(sql + " ORDER BY id", params).fetchall()
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if unit_id is not None:
+            clauses.append("unit_id = ?")
+            params.append(unit_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(f"SELECT * FROM reconcile_deletion{where} ORDER BY id", tuple(params)).fetchall()  # noqa: S608
         return [{**dict(r), "evidence": json.loads(r["evidence_json"])} for r in rows]
 
-    def runs(self) -> list[dict[str, Any]]:
-        rows = self._conn.execute("SELECT * FROM reconcile_run ORDER BY started_at, id").fetchall()
-        return [dict(r) for r in rows]
+    # -- cursors + verdict cache --------------------------------------------
 
     def get_cursor(self, agent_id: str) -> ScopeCursor:
         row = self._conn.execute(
@@ -177,4 +278,4 @@ class ReconcileLog:
         self._conn.close()
 
 
-__all__ = ["DeletionRecord", "ReconcileLog", "ScopeCursor"]
+__all__ = ["DeletionRecord", "ReconcileLog", "RunRow", "ScopeCursor"]

@@ -83,6 +83,8 @@ from tpasini.recordatio.proxy.runtime import (
     resolve_model as _resolve_model,
 )
 from tpasini.recordatio.proxy.transcript_log import TranscriptLog
+from tpasini.recordatio.reconcile import ReconcileSettings
+from tpasini.recordatio.reconcile import build_service as build_reconcile_service
 from tpasini.recordatio.storage.base import SQLiteStore
 from tpasini.recordatio.storage.memory_feedback import MemoryFeedbackStore
 from tpasini.recordatio.wikidata import resolve_entity
@@ -168,7 +170,12 @@ def _ensure_user_entity(agent_id: str) -> None:
 
 app = FastAPI(title="agentmem")
 init_tracing(app, settings.otel_exporter_otlp_endpoint, settings.otel_service_name)
-network_guard.install(app, settings.recordatio_restricted_networks, settings.recordatio_recall_key_sha256)
+network_guard.install(
+    app,
+    settings.recordatio_restricted_networks,
+    settings.recordatio_recall_key_sha256,
+    settings.recordatio_reconcile_key_sha256,
+)
 
 _background_tasks: set[asyncio.Task] = set()
 
@@ -1004,7 +1011,8 @@ register_feedback_routes(
     memory_feedback_store=memory_feedback_store,
     user_label=_USER_ENTITY_LABEL,
 )
-register_reconcile_routes(app, get_store=lambda: store, memory_feedback_store=memory_feedback_store)
+reconcile_service = build_reconcile_service(store, settings=ReconcileSettings(), feedback=memory_feedback_store)
+register_reconcile_routes(app, get_service=lambda: reconcile_service)
 
 
 async def _close_agent_warm_pool() -> None:
