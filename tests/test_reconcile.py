@@ -99,6 +99,13 @@ def verdict(pair: dict, relation: str, *, keep: KnowledgeUnit | None = None, dro
     }
 
 
+def _embed(store: SQLiteStore, scope: str, *units: KnowledgeUnit, vec: list[float] | None = None) -> None:
+    blob = embeddings.pack_embedding(vec or [1.0, 0.0, 0.0, 0.0])
+    for u in units:
+        store.upsert_item_embedding(item_id=u.id, agent_id=scope, kind="unit", surface_hash=u.id,
+                                    embedding=blob, model="m", asserted_at=T0.isoformat())
+
+
 def _judge(svc: ReconcileService, keep: KnowledgeUnit, drop: KnowledgeUnit, relation: str,
            facts: list[tuple[str, str, str]], **kw: object) -> dict:
     p = _pair(svc, keep, drop)
@@ -128,6 +135,7 @@ def test_partial_overlap_with_extra_fact_is_kept_and_not_reoffered(store: SQLite
     other = _unit("Sam lives in Springfield near the river since 2019", at=T0 + timedelta(days=1))
     store.add(keep, SCOPE)
     store.add(other, SCOPE)
+    _embed(store, SCOPE, keep, other)
     svc = _service(store)
 
     # An overreaching verdict: claims subsumption but cannot quote the extra fact.
@@ -518,6 +526,50 @@ def test_budget_caps_pairs_per_run(store: SQLiteStore) -> None:
     assert svc.candidates("sam", "night-2", limit=25)["pairs"]  # the next run continues
 
 
+def test_candidates_capped_per_unit_and_ordered_by_similarity(store: SQLiteStore) -> None:
+    hub = _unit("Sam likes Springfield")
+    spokes = [_unit(f"Sam likes Springfield park {i}", at=T0 + timedelta(hours=i + 1)) for i in range(6)]
+    store.add(hub, SCOPE)
+    _embed(store, SCOPE, hub)
+    for i, u in enumerate(spokes):
+        store.add(u, SCOPE)
+        # Spoke i sits at a decreasing cosine from the hub; spokes are mutually distant.
+        sim = 0.995 - 0.01 * i
+        other = [0.0, 0.0, 0.0, 0.0]
+        other[1 + i % 3] = (1 - sim * sim) ** 0.5
+        _embed(store, SCOPE, u, vec=[sim, *other[1:]])
+    svc = _service(store, max_neighbours_per_unit=2, fts_min_overlap=2.0)
+
+    pairs = svc.candidates("sam", RUN, limit=25)["pairs"]
+
+    hub_pairs = [p for p in pairs if hub.id in (p["a"]["id"], p["b"]["id"])]
+    scores = [p["score"] for p in pairs]
+    assert scores == sorted(scores, reverse=True)  # most similar first
+    assert pairs == svc.candidates("sam", RUN, limit=25)["pairs"]  # stable order
+    assert {p["signal"] for p in pairs} == {"embedding"}  # FTS-only pairs disabled
+    assert len(hub_pairs) >= 1
+    per_unit: dict[str, int] = {}
+    for p in pairs:
+        per_unit[p["a"]["id"]] = per_unit.get(p["a"]["id"], 0) + 1
+    assert max(per_unit.values()) <= 2
+
+
+def test_fts_only_pairs_need_word_overlap(store: SQLiteStore) -> None:
+    a = _unit("Sam walks the dog in Springfield park every morning")
+    near = _unit("Sam walks the dog in Springfield park", at=T0 + timedelta(days=1))
+    topical = _unit("Springfield park opens a new cafe", at=T0 + timedelta(days=2))
+    for u in (a, near, topical):
+        store.add(u, SCOPE)
+    svc = _service(store, fts_min_overlap=0.5)
+
+    got = {frozenset((p["a"]["id"], p["b"]["id"])) for p in svc.candidates("sam", RUN, limit=25)["pairs"]}
+
+    assert frozenset((a.id, near.id)) in got
+    assert not any(topical.id in pair for pair in got)
+    stats = svc.pair_stats("sam")
+    assert stats["open_pairs"] == len(got) and all(k.startswith("fts/same-scope/") for k in stats["by_bucket"])
+
+
 def test_embedding_signal_proposes_pairs(store: SQLiteStore) -> None:
     a = _unit("Sam resides in Springfield")
     b = _unit("Sam's home town is Springfield", at=T0 + timedelta(days=1))
@@ -640,20 +692,68 @@ def test_active_unit_never_dropped_for_an_inactive_keeper(store: SQLiteStore, fe
     assert dup.id in _units(store)
 
 
-def test_legacy_purges_only_provably_superseded(store: SQLiteStore) -> None:
-    past = T0 - timedelta(days=10)
+def _legacy_pairs(svc: ReconcileService) -> list[dict]:
+    return [p for p in svc.candidates("sam", RUN, limit=25)["pairs"] if p["kind"] == "legacy-correction"]
+
+
+def test_legacy_corrections_are_judged_never_purged_blindly(store: SQLiteStore) -> None:
+    past = T0 + timedelta(days=1)
     corrected = _unit("Sam lives in Springfield", valid_until=past)
-    correction = _unit("Sam lives in Shelbyville", provenance=f"correction of {corrected.id}")
+    correction = _unit("Sam lives in Shelbyville", at=past, provenance=f"correction of {corrected.id}")
     tombstoned = _unit("Sam likes jazz", valid_until=past)
     expired = _unit("Sam is on holiday this week", kind=KnowledgeType.EPISODIC, valid_until=past)
     for u in (corrected, correction, tombstoned, expired):
         store.add(u, SCOPE)
+    svc = _service(store)
 
-    summary = _service(store).finish("sam", RUN)
+    preview = svc.finish("sam", RUN, dry_run=True)
+    assert preview["would_delete"] == []  # nothing is purged without a verdict
+    assert preview["legacy_unclassified_kept"] == 2
+    [pair] = _legacy_pairs(svc)
+    assert {pair["a"]["id"], pair["b"]["id"]} == {corrected.id, correction.id}
+    assert pair["may_drop_only"] == ("A" if pair["a"]["id"] == corrected.id else "B")
 
+    out = svc.apply("sam", RUN, pair["pair_token"], verdict(
+        pair, "supersedes", keep=correction, drop=corrected,
+        facts=[("Sam lives in Springfield", "Sam lives in Shelbyville", "replaced")]))
+
+    assert out["outcome"] == "deleted"
     assert set(_units(store)) == {correction.id, tombstoned.id, expired.id}
-    assert summary["legacy_unclassified_kept"] == 2
-    assert summary["by_source"] == {"legacy": 1}
+
+
+def test_legacy_correction_that_lost_a_name_keeps_the_original(store: SQLiteStore) -> None:
+    past = T0 + timedelta(days=1)
+    original = _unit("Sam and Alex have a baby/young child named Otto.", valid_until=past)
+    rewrite = _unit("Sam and Alex have a baby/young child.", at=past, provenance=f"correction of {original.id}")
+    store.add(original, SCOPE)
+    store.add(rewrite, SCOPE)
+    svc = _service(store)
+    [pair] = _legacy_pairs(svc)
+
+    # Even a judge that calls it a duplicate cannot account for the name.
+    out = svc.apply("sam", RUN, pair["pair_token"], verdict(
+        pair, "duplicate_subsumed", keep=rewrite, drop=original,
+        facts=[("Sam and Alex have a baby/young child", "Sam and Alex have a baby/young child", "same")]))
+    svc.finish("sam", RUN)
+
+    assert out["outcome"] == "kept" and "not accounted for" in out["reason"]
+    assert set(_units(store)) == {original.id, rewrite.id}
+
+
+def test_legacy_correction_follows_the_chain_to_the_active_end(store: SQLiteStore) -> None:
+    d1, d2 = T0 + timedelta(days=1), T0 + timedelta(days=2)
+    original = _unit("Sam lives in Springfield", valid_until=d1)
+    first = _unit("Sam lives in Shelbyville", at=d1, valid_until=d2, provenance=f"correction of {original.id}")
+    latest = _unit("Sam lives in Capital City", at=d2, provenance=f"correction of {first.id}")
+    dead_end = _unit("Sam likes jazz", valid_until=d1)
+    dead_fix = _unit("Sam likes blues", at=d1, valid_until=d2, provenance=f"correction of {dead_end.id}")
+    for u in (original, first, latest, dead_end, dead_fix):
+        store.add(u, SCOPE)
+
+    pairs = _legacy_pairs(_service(store))
+
+    got = {frozenset((p["a"]["id"], p["b"]["id"])) for p in pairs}
+    assert got == {frozenset((original.id, latest.id)), frozenset((first.id, latest.id))}  # dead end: keep both
 
 
 # ---------------------------------------------------------------------------
@@ -801,3 +901,34 @@ def test_cli_dry_run_writes_nothing(tmp_path: Path) -> None:
     report = json.loads(out.read_text())
     assert report["dry_run"] is True
     assert report["users"]["sam"]["outcomes"] == {"kept": 1}
+
+
+def test_cli_max_pairs_and_stats(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from tpasini.recordatio import cli
+
+    db = tmp_path / "memories.db"
+    seed = SQLiteStore(db)
+    for topic in ("tea", "jazz", "chess"):
+        seed.add(_unit(f"Sam likes {topic} on Sundays with friends"), SCOPE)
+        seed.add(_unit(f"Sam likes {topic} on Sundays", at=T0 + timedelta(days=1)), SCOPE)
+    seed._conn.close()
+    judge = tmp_path / "judge.py"
+    judge.write_text(
+        "import json, sys\n"
+        "text = sys.stdin.read()\n"
+        "pairs = json.loads(text.split('## Pairs\\n\\n', 1)[1].split('\\n\\n## Reply format', 1)[0])\n"
+        "print(json.dumps([{'pair_token': p['pair_token'], 'verdict': {'relation': 'unsure'}} for p in pairs]))\n"
+    )
+    rules = tmp_path / "rules.md"
+    rules.write_text("Judge strictly.")
+    out = tmp_path / "report.json"
+
+    assert cli.reconcile_main(["--db", str(db), "--stats"]) == 0
+    stats = json.loads(capsys.readouterr().out)
+    assert stats[0]["user_id"] == "sam" and stats[0]["open_pairs"] >= 3
+
+    assert cli.reconcile_main([
+        "--db", str(db), "--judge-cmd", f"{sys.executable} {judge}", "--judge-prompt", str(rules),
+        "--max-pairs", "1", "--output", str(out),
+    ]) == 0
+    assert json.loads(out.read_text())["users"]["sam"]["outcomes"] == {"kept": 1}

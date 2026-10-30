@@ -12,8 +12,8 @@ routine, or the ``agentmem reconcile`` harness) loops over three calls:
    physically deletes the dropped unit only if everything passes. The outcome
    is recorded per token: a replay returns it and never has a second effect.
    Kept verdicts go into the verdict cache so the pair is not offered again.
-3. ``finish`` — deterministic work (exact duplicates, units a human-approved
-   correction already superseded), settling pending memory-feedback ops,
+3. ``finish`` — deterministic work (exact duplicates only), settling pending
+   memory-feedback ops,
    advancing the incremental cursors, VACUUM, and the run summary. Replays
    return the stored summary.
 
@@ -24,6 +24,10 @@ always within one scope, or across the user's shared scope
 (``{user}/_user``) and one of their agent scopes with the shared copy kept.
 Never across users, never in favour of an inactive unit. Nothing else is
 deleted: stale-looking, low-value and naturally expired units stay.
+
+Units a ``correct`` op already invalidated are offered as pairs against the
+active end of their correction chain (the replacement text was model-written,
+so the original goes only if the judge shows nothing of it is lost).
 
 Pending feedback ops become pairs in ``candidates`` (a tombstone's target
 against its neighbours, a merge's canonical against each duplicate, the
@@ -44,7 +48,7 @@ import re
 import shutil
 from collections import Counter
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -99,6 +103,7 @@ class Pair:
     signal: str
     op_id: int | None = None
     want_drop: str | None = None  # the only unit this pair may delete
+    score: float = 0.0  # similarity (cosine, or word overlap for FTS pairs); orders candidates
 
 
 def _unit_sig(u: KnowledgeUnit, scope: str) -> list[object]:
@@ -188,6 +193,7 @@ class ReconcileService:
                 "signal": p.signal,
                 "op_id": p.op_id,
                 "may_drop_only": ("A" if p.want_drop == p.a.id else "B") if p.want_drop else None,
+                "score": round(p.score, 4),
                 "a": unit_view(p.a, p.a_scope),
                 "b": unit_view(p.b, p.b_scope),
             })
@@ -220,6 +226,9 @@ class ReconcileService:
                 if fresh(p):
                     yield p
         for p in self._legacy_merge_pairs(user_id):
+            if fresh(p):
+                yield p
+        for p in self._legacy_correction_pairs(user_id):
             if fresh(p):
                 yield p
         for p in self._candidate_pairs(user_id, exclude=exact_drops):
@@ -257,11 +266,13 @@ class ReconcileService:
                     found = candidate_pairs(
                         self._store, [target], self._active(pool_scope),
                         focus_scope=scope, pool_scope=pool_scope,
-                        cosine_threshold=self._cfg.cosine_threshold, fts_neighbours=self._cfg.tombstone_neighbours,
+                        tuning=replace(self._cfg.tuning(), max_per_unit=self._cfg.tombstone_neighbours),
                     )
                     pairs += [
-                        Pair(target, scope, c.b, pool_scope, "op", "op:tombstone", op.id, target.id) for c in found
+                        Pair(target, scope, c.b, pool_scope, "op", "op:tombstone", op.id, target.id, c.score)
+                        for c in found
                     ]
+                pairs.sort(key=lambda p: (-p.score, p.b.id))
                 return pairs[: self._cfg.tombstone_neighbours]
             if op.op_type == "merge":
                 canonical, scope = _require_unit(self._store, user_id, str(op.target.get("canonical_id", "")))
@@ -273,7 +284,7 @@ class ReconcileService:
                     if str(dup_id) == canonical.id:
                         continue
                     dup, dup_scope = _require_unit(self._store, user_id, str(dup_id))
-                    out.append(Pair(canonical, scope, dup, dup_scope, "op", "op:merge", op.id, dup.id))
+                    out.append(Pair(canonical, scope, dup, dup_scope, "op", "op:merge", op.id, dup.id, 1.0))
                 return out
         except InvalidOpError:
             return []
@@ -301,8 +312,53 @@ class ReconcileService:
                 if dup is None or dup[0].id == canonical[0].id or _is_active(dup[0]):
                     continue
                 yield Pair(
-                    canonical[0], canonical[1], dup[0], dup[1], "legacy-merge", "applied-merge", op.id, dup[0].id
+                    canonical[0], canonical[1], dup[0], dup[1], "legacy-merge", "applied-merge", op.id, dup[0].id, 1.0
                 )
+
+    def _corrections(self, scope: str) -> dict[str, list[KnowledgeUnit]]:
+        """``{source id: [units recorded as "correction of <source id>"]}`` for one scope."""
+        out: dict[str, list[KnowledgeUnit]] = {}
+        for active in (True, False):
+            for u, _ in self._store.scope_units(scope, active=active):
+                if u.provenance.startswith("correction of "):
+                    out.setdefault(u.provenance.removeprefix("correction of "), []).append(u)
+        return out
+
+    def _successors(self, unit: KnowledgeUnit, corrections: dict[str, list[KnowledgeUnit]]) -> list[KnowledgeUnit]:
+        """Units that replaced ``unit``: its corrections, and newer sibling corrections of its own source."""
+        succ = list(corrections.get(unit.id, []))
+        if unit.provenance.startswith("correction of "):
+            siblings = corrections.get(unit.provenance.removeprefix("correction of "), [])
+            succ += [s for s in siblings if s.id != unit.id and recency(s) > recency(unit)]
+        return succ
+
+    def _active_successor(
+        self, unit: KnowledgeUnit, corrections: dict[str, list[KnowledgeUnit]], depth: int = 0
+    ) -> KnowledgeUnit | None:
+        """The active end of ``unit``'s correction chain, or None when the chain ends inactive."""
+        succ = self._successors(unit, corrections)
+        active = [s for s in succ if _is_active(s)]
+        if active:
+            return max(active, key=recency)
+        if depth >= 8:
+            return None
+        for s in sorted(succ, key=recency, reverse=True):
+            if (found := self._active_successor(s, corrections, depth + 1)) is not None:
+                return found
+        return None
+
+    def _legacy_correction_pairs(self, user_id: str) -> Iterator[Pair]:
+        """Invalidated originals a ``correct`` op replaced, paired with the active
+        end of their correction chain. The replacement text was model-written,
+        so the original is dropped only if the judge shows the replacement
+        states every one of its facts (``verify_verdict``)."""
+        for scope in self._store.user_scopes(user_id):
+            corrections = self._corrections(scope)
+            if not corrections:
+                continue
+            for unit, _ in self._store.scope_units(scope, active=False):
+                if (keep := self._active_successor(unit, corrections)) is not None:
+                    yield Pair(keep, scope, unit, scope, "legacy-correction", "correction", None, unit.id, 1.0)
 
     def _focus(self, scope: str) -> tuple[list[KnowledgeUnit], list[KnowledgeUnit], ScopeCursor]:
         """(active units, focus units, cursor to persist once the scope is done).
@@ -342,13 +398,42 @@ class ReconcileService:
         for pool_scope, pool in pools:
             for c in candidate_pairs(
                 self._store, focus, pool, focus_scope=scope, pool_scope=pool_scope,
-                cosine_threshold=self._cfg.cosine_threshold, fts_neighbours=self._cfg.fts_neighbours, exclude=exclude,
+                tuning=self._cfg.tuning(), exclude=exclude,
             ):
-                yield Pair(c.a, scope, c.b, pool_scope, "candidate", c.signal)
+                yield Pair(c.a, scope, c.b, pool_scope, "candidate", c.signal, score=c.score)
 
     def _candidate_pairs(self, user_id: str, *, exclude: set[str]) -> Iterator[Pair]:
-        for scope in self._store.user_scopes(user_id):
-            yield from self._scope_pairs(user_id, scope, exclude=exclude)
+        """Every scope's candidates, most similar first across the user, in a
+        stable order, so each night's budget goes to the likeliest duplicates."""
+        pairs = [
+            p for scope in self._store.user_scopes(user_id) for p in self._scope_pairs(user_id, scope, exclude=exclude)
+        ]
+        pairs.sort(key=lambda p: (-p.score, p.a.id, p.b.id))
+        yield from pairs
+
+    def pair_stats(self, user_id: str) -> dict[str, Any]:
+        """Distribution of the undecided pairs by source and similarity, for tuning.
+
+        Candidate buckets are ``<signal>/<same|cross>-scope/<score band>``.
+        """
+        def band(score: float) -> str:
+            for edge in (0.99, 0.97, 0.95, 0.92, 0.90, 0.85, 0.7, 0.5):
+                if score >= edge:
+                    return f">={edge:.2f}"
+            return "<0.50"
+
+        counts: Counter = Counter()
+        total = 0
+        for p in self._open_pairs(user_id):
+            total += 1
+            if p.kind != "candidate":
+                counts[p.kind] += 1
+                continue
+            where = "same" if p.a_scope == p.b_scope else "cross"
+            counts[f"{p.signal}/{where}-scope/{band(p.score)}"] += 1
+        return {"user_id": user_id, "open_pairs": total, "by_bucket": dict(sorted(counts.items())),
+                "budget_per_run": self._cfg.max_pairs_per_run,
+                "runs_to_drain": -(-total // max(1, self._cfg.max_pairs_per_run))}
 
     # ------------------------------------------------------------------
     # apply
@@ -546,30 +631,11 @@ class ReconcileService:
             for d in exact_duplicates(scoped, self._user_scope(user_id))
         ]
 
-    def _correction_plan(self, user_id: str) -> list[_Deletion]:
-        """Invalidated units a human-approved ``correct`` op provably superseded:
-        a unit recorded as ``correction of <id>`` exists, or a newer sibling
-        correction of the same source does."""
-        out: list[_Deletion] = []
-        for scope in self._store.user_scopes(user_id):
-            for unit, _ in self._store.scope_units(scope, active=False):
-                successors = self._store.units_by_provenance(scope, f"correction of {unit.id}")
-                if not successors and unit.provenance.startswith("correction of "):
-                    successors = [
-                        s for s in self._store.units_by_provenance(scope, unit.provenance)
-                        if s.id != unit.id and recency(s) > recency(unit)
-                    ]
-                if successors:
-                    keep = max(successors, key=recency)
-                    out.append(_Deletion(unit=unit, scope=scope, kept=keep, relation="supersedes",
-                                         source="legacy:correction", evidence={"provenance": keep.provenance}))
-        return out
-
     def _deterministic_plan(self, user_id: str) -> list[_Deletion]:
         plan: list[_Deletion] = []
         dropped: set[str] = set()
         kept: set[str] = set()
-        for d in [*self._exact_plan(user_id), *self._correction_plan(user_id)]:
+        for d in self._exact_plan(user_id):
             if d.unit.id in dropped or d.unit.id in kept or (d.kept and d.kept.id in dropped):
                 continue
             dropped.add(d.unit.id)
@@ -583,12 +649,14 @@ class ReconcileService:
         merged = {
             str(d) for op in self._applied_merges(user_id) for d in (op.target.get("duplicate_ids") or [])
         }
-        return sum(
-            1
-            for scope in self._store.user_scopes(user_id)
-            for unit, _ in self._store.scope_units(scope, active=False)
-            if unit.id not in planned and unit.id not in merged
-        )
+        count = 0
+        for scope in self._store.user_scopes(user_id):
+            corrections = self._corrections(scope)
+            for unit, _ in self._store.scope_units(scope, active=False):
+                if unit.id in planned or unit.id in merged or self._successors(unit, corrections):
+                    continue
+                count += 1
+        return count
 
     def _settle_ops(self, user_id: str) -> list[tuple[MemoryFeedbackOp, str, str]]:
         """``(op, "apply" | "dismiss" | "pending", result)`` for every pending op."""

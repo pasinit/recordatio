@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 from tpasini.recordatio.models import KnowledgeType, KnowledgeUnit
 from tpasini.recordatio.reconcile.judge import recency
+from tpasini.recordatio.retrieval_text import content_words
 from tpasini.recordatio.storage.base import SQLiteStore
 
 _EDGE_PUNCT_RE = re.compile(r"^[\s\"'`.,;:!?()\[\]-]+|[\s\"'`.,;:!?()\[\]-]+$")
@@ -106,18 +107,46 @@ def exact_duplicates(scoped: list[tuple[KnowledgeUnit, str]], user_scope: str) -
     return out
 
 
-def _embedding_pairs(
+@dataclass(frozen=True)
+class PairTuning:
+    """Candidate-volume knobs (``ReconcileSettings`` feeds them from env).
+
+    - ``cosine_threshold``: minimum embedding cosine for an embedding pair.
+    - ``max_per_unit``: at most this many neighbours per focus unit, best first
+      (embedding and FTS pairs together), so one generic unit cannot flood a run.
+    - ``fts_neighbours``: BM25 neighbours looked up per focus unit.
+    - ``fts_min_overlap``: an FTS-only pair is kept only when the two units'
+      content words overlap at least this much (Jaccard). BM25 alone surfaces
+      topical neighbours, not duplicates; set above 1 to drop FTS-only pairs.
+    """
+
+    cosine_threshold: float = 0.90
+    max_per_unit: int = 3
+    fts_neighbours: int = 3
+    fts_min_overlap: float = 0.5
+
+
+def word_overlap(a: str, b: str) -> float:
+    """Jaccard overlap of the two texts' content words (pipeline-normalised)."""
+    wa, wb = content_words(a), content_words(b)
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
+def _embedding_neighbours(
     store: SQLiteStore,
     focus: list[KnowledgeUnit],
     focus_scope: str,
     pool: dict[str, KnowledgeUnit],
     pool_scope: str,
-    threshold: float,
-) -> list[CandidatePair]:
+    tuning: PairTuning,
+) -> dict[str, list[CandidatePair]]:
+    """Per focus unit: its pool neighbours at or above the cosine threshold, best first."""
     focus_blobs = store.scope_unit_embeddings(focus_scope, [u.id for u in focus])
     pool_blobs = store.scope_unit_embeddings(pool_scope, list(pool))
     if not focus_blobs or not pool_blobs:
-        return []
+        return {}
     import numpy as np
 
     def matrix(blobs: dict[str, bytes]) -> tuple[list[str], np.ndarray]:
@@ -131,13 +160,17 @@ def _embedding_pairs(
     pool_ids, pmat = matrix(pool_blobs)
     by_id = {u.id: u for u in focus}
     sims = fmat @ pmat.T
-    out: list[CandidatePair] = []
+    out: dict[str, list[CandidatePair]] = {}
     for row, fid in enumerate(focus_ids):
-        for col in np.nonzero(sims[row] >= threshold)[0]:
+        cols = np.nonzero(sims[row] >= tuning.cosine_threshold)[0]
+        found = []
+        for col in cols:
             other = pool[pool_ids[int(col)]]
             if other.id == fid or other.type is not by_id[fid].type:
                 continue
-            out.append(CandidatePair(a=by_id[fid], b=other, signal="embedding", score=float(sims[row, col])))
+            found.append(CandidatePair(a=by_id[fid], b=other, signal="embedding", score=float(sims[row, col])))
+        found.sort(key=lambda p: (-p.score, p.b.id))
+        out[fid] = found
     return out
 
 
@@ -148,46 +181,53 @@ def candidate_pairs(
     *,
     focus_scope: str,
     pool_scope: str,
-    cosine_threshold: float,
-    fts_neighbours: int,
+    tuning: PairTuning,
     exclude: set[str] | None = None,
 ) -> list[CandidatePair]:
-    """Deduplicated pairs (focus unit, pool unit), best first.
+    """Deduplicated pairs (focus unit, pool unit), most similar first.
 
     ``focus_scope == pool_scope`` pairs within one scope; otherwise across two
-    scopes of the same user. Embedding pairs rank by cosine (desc); FTS-only
-    pairs follow in BM25 rank order. Units in ``exclude`` never pair.
+    scopes of the same user. Each focus unit contributes at most
+    ``tuning.max_per_unit`` pairs: its embedding neighbours by cosine, then
+    FTS neighbours that pass the word-overlap bar (scored by that overlap).
+    The result is sorted by score, then ids, so the order is stable from one
+    call to the next. Units in ``exclude`` never pair.
     """
     exclude = exclude or set()
     by_id = {u.id: u for u in pool if u.id not in exclude}
     focus = [u for u in focus if u.id not in exclude]
+    embedded = _embedding_neighbours(store, focus, focus_scope, by_id, pool_scope, tuning)
     seen: set[frozenset[str]] = set()
     out: list[CandidatePair] = []
-
-    embedded = _embedding_pairs(store, focus, focus_scope, by_id, pool_scope, cosine_threshold)
-    for p in sorted(embedded, key=lambda p: (-p.score, p.a.id, p.b.id)):
-        key = frozenset((p.a.id, p.b.id))
-        if key not in seen:
-            seen.add(key)
-            out.append(p)
-
-    fts_pairs: list[CandidatePair] = []
     for u in focus:
-        for rank, other_id in enumerate(store.fts_unit_neighbours(u.content, pool_scope, fts_neighbours + 1)):
-            other = by_id.get(other_id)
-            if other is None or other.id == u.id or other.type is not u.type:
-                continue
-            key = frozenset((u.id, other.id))
-            if key in seen:
-                continue
-            seen.add(key)
-            fts_pairs.append(CandidatePair(a=u, b=other, signal="fts", score=float(-rank)))
-    fts_pairs.sort(key=lambda p: (-p.score, p.a.id, p.b.id))
-    return out + fts_pairs
+        mine: list[CandidatePair] = []
+        for p in embedded.get(u.id, []):
+            key = frozenset((p.a.id, p.b.id))
+            if key not in seen and len(mine) < tuning.max_per_unit:
+                seen.add(key)
+                mine.append(p)
+        if len(mine) < tuning.max_per_unit and tuning.fts_neighbours > 0 and tuning.fts_min_overlap <= 1:
+            fts: list[CandidatePair] = []
+            for other_id in store.fts_unit_neighbours(u.content, pool_scope, tuning.fts_neighbours + 1):
+                other = by_id.get(other_id)
+                if other is None or other.id == u.id or other.type is not u.type:
+                    continue
+                if frozenset((u.id, other.id)) in seen:
+                    continue
+                overlap = word_overlap(u.content, other.content)
+                if overlap >= tuning.fts_min_overlap:
+                    fts.append(CandidatePair(a=u, b=other, signal="fts", score=overlap))
+            for p in sorted(fts, key=lambda p: (-p.score, p.b.id))[: tuning.max_per_unit - len(mine)]:
+                seen.add(frozenset((p.a.id, p.b.id)))
+                mine.append(p)
+        out += mine
+    out.sort(key=lambda p: (-p.score, p.a.id, p.b.id))
+    return out
 
 
 __all__ = [
     "CandidatePair",
+    "PairTuning",
     "ExactDuplicate",
     "candidate_pairs",
     "content_hash",
@@ -195,4 +235,5 @@ __all__ = [
     "exact_key",
     "normalise_content",
     "pair_key",
+    "word_overlap",
 ]

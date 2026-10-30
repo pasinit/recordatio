@@ -230,8 +230,12 @@ any command that reads a prompt on stdin. It is a dry run unless you pass
 
 ```sh
 AGENTMEM_DB=/copy/memories.db agentmem reconcile \
-  --judge-cmd 'claude -p' --judge-prompt memory_reconcile_rules.md --output report.json
+  --judge-cmd 'claude -p' --judge-prompt memory_reconcile_rules.md --max-pairs 50 --output report.json
 ```
+
+`agentmem reconcile --stats` prints how many open pairs each user has, by source and similarity band,
+with no judge. Use it to tune `RECORDATIO_RECONCILE_COSINE_THRESHOLD`,
+`…_MAX_NEIGHBOURS_PER_UNIT`, `…_FTS_NEIGHBOURS`, `…_FTS_MIN_OVERLAP` and `…_MAX_PAIRS_PER_RUN`.
 
 ## Contributing
 

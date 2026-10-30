@@ -30,8 +30,11 @@ def reconcile_main(argv: list[str]) -> int:
     default_db = os.environ.get("AGENTMEM_DB") or str(Path.home() / ".agentmem" / "memories.db")
     parser.add_argument("--db", type=Path, default=Path(default_db), help="memory store (default: $AGENTMEM_DB)")
     parser.add_argument("--user", action="append", dest="users", help="user id to reconcile (repeatable; default all)")
-    parser.add_argument("--judge-cmd", required=True, help="command reading the prompt on stdin, e.g. 'claude -p'")
-    parser.add_argument("--judge-prompt", type=Path, required=True, help="file with the routine's judging rules")
+    parser.add_argument("--judge-cmd", help="any command reading the prompt on stdin and printing the verdicts")
+    parser.add_argument("--judge-prompt", type=Path, help="file with the routine's judging rules")
+    parser.add_argument("--max-pairs", type=int, help="pairs to judge per user (default: the per-run budget)")
+    parser.add_argument("--stats", action="store_true",
+                        help="print the open-pair distribution per user (no judge needed) and exit")
     parser.add_argument("--batch", type=int, default=10, help="pairs per judge call (default 10)")
     parser.add_argument("--judge-timeout", type=float, default=600.0, help="seconds per judge call (default 600)")
     parser.add_argument("--apply", action="store_true", help="delete for real (default: dry run)")
@@ -50,7 +53,8 @@ def reconcile_main(argv: list[str]) -> int:
 
     if not args.db.exists():
         parser.error(f"no memory store at {args.db}")
-    rules = args.judge_prompt.read_text(encoding="utf-8")
+    if not args.stats and not (args.judge_cmd and args.judge_prompt):
+        parser.error("--judge-cmd and --judge-prompt are required (unless --stats)")
     feedback_path = args.db.parent / "memory_feedback.db"
     log_path = reconcile_log_path(args.db)
     if args.apply:
@@ -62,7 +66,15 @@ def reconcile_main(argv: list[str]) -> int:
         store = SQLiteStore(args.db, ephemeral_fts=True, ephemeral_emb=not Path(f"{args.db}.emb").exists())
         log = ReconcileLog(log_path if log_path.exists() else Path(":memory:"))
         feedback = MemoryFeedbackStore(feedback_path) if feedback_path.exists() else None
-    service = build_service(store, settings=ReconcileSettings(), feedback=feedback, log=log)
+    settings = ReconcileSettings()
+    if args.max_pairs is not None:
+        settings = settings.model_copy(update={"max_pairs_per_run": max(0, args.max_pairs)})
+    service = build_service(store, settings=settings, feedback=feedback, log=log)
+    if args.stats:
+        stats = [service.pair_stats(user) for user in (args.users or service.users())]
+        print(json.dumps(stats, indent=2, sort_keys=True))
+        return 0
+    rules = args.judge_prompt.read_text(encoding="utf-8")
     report = run_harness(
         service,
         args.users or service.users(),
