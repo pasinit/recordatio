@@ -218,6 +218,16 @@ class MemoryFeedbackStore:
                 (status, datetime.now(UTC).isoformat(), result, op_id),
             )
 
+    def backup_to(self, target: Path) -> None:
+        """Consistent snapshot of this DB via the sqlite backup API."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        dest = sqlite3.connect(str(target))
+        try:
+            with self._lock:
+                self._conn.backup(dest)
+        finally:
+            dest.close()
+
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> MemoryFeedbackRecord:
         return MemoryFeedbackRecord(

@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     # GET /v1/users/{user_id}/briefing.
     recordatio_restricted_networks: list[str] = []
     recordatio_recall_key_sha256: list[str] = []
+    # Reconcile keys (SHA-256 hex digests): may call only the memory-reconcile
+    # routes, from anywhere including the restricted networks (the nightly
+    # judge agent on the Cardea host).
+    recordatio_reconcile_key_sha256: list[str] = []
 
     # Storage
     agentmem_db: str = str(Path.home() / ".agentmem" / "memories.db")

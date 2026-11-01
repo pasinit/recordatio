@@ -8,8 +8,12 @@ else:
 * A **recall key** (configured by SHA-256 hash, never in plain text) may call
   only ``GET /v1/users/{user_id}/memory-search`` and
   ``GET /v1/users/{user_id}/briefing``, from anywhere.
+* A **reconcile key** (also by SHA-256 hash) may call only the memory
+  reconcile routes, ``/v1/users/{user_id}/memory-reconcile/...`` — the nightly
+  judge agent's candidates / verdicts / finish calls. It cannot read memories
+  any other way.
 * A request from a **restricted network** (CIDRs, e.g. a private VPC) must
-  present a recall key; anything else from there is refused.
+  present a recall or reconcile key; anything else from there is refused.
 
 Requests that are neither from a restricted network nor carry a recall key
 are untouched, so local callers keep their current behaviour.
@@ -25,6 +29,9 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 RECALL_PATH = re.compile(r"^/v1/users/[^/]+/(?:memory-search|briefing)$")
+RECONCILE_PATH = re.compile(
+    r"^/v1/users/[^/]+/memory-reconcile/(?:candidates|verdicts(?:/[^/]+)?|runs/[^/]+(?:/finish)?)$"
+)
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -43,13 +50,17 @@ def is_recall_key(api_key: str | None, key_hashes: Iterable[str]) -> bool:
 
 
 def decide(client_host: str | None, method: str, path: str, api_key: str | None,
-           networks: list[Network], key_hashes: Iterable[str]) -> int | None:
+           networks: list[Network], key_hashes: Iterable[str],
+           reconcile_hashes: Iterable[str] = ()) -> int | None:
     """Return an HTTP status to refuse the request with, or ``None`` to let it through.
 
-    ``401``: a restricted-network caller without a recall key.
-    ``403``: a recall key (or restricted caller) asking for anything but memory search
-    or a briefing preview.
+    ``401``: a restricted-network caller without a recall or reconcile key.
+    ``403``: a recall key asking for anything but memory search or a briefing
+    preview, or a reconcile key asking for anything but the reconcile routes.
     """
+    if is_recall_key(api_key, reconcile_hashes):
+        # Checked first: a reconcile key is never also a recall key.
+        return None if RECONCILE_PATH.match(path) and method in ("GET", "POST") else 403
     recall = is_recall_key(api_key, key_hashes)
     restricted = False
     if client_host and networks:
@@ -77,18 +88,20 @@ def _api_key(request: Request) -> str | None:
     return key or None
 
 
-def install(app: FastAPI, restricted_networks: Iterable[str], recall_key_hashes: Iterable[str]) -> None:
-    """Add the guard as HTTP middleware. A no-op when both lists are empty."""
+def install(app: FastAPI, restricted_networks: Iterable[str], recall_key_hashes: Iterable[str],
+            reconcile_key_hashes: Iterable[str] = ()) -> None:
+    """Add the guard as HTTP middleware. A no-op when all lists are empty."""
     networks = parse_networks(restricted_networks)
     hashes = [h for h in recall_key_hashes if h.strip()]
-    if not networks and not hashes:
+    reconcile = [h for h in reconcile_key_hashes if h.strip()]
+    if not networks and not hashes and not reconcile:
         return
 
     @app.middleware("http")
     async def network_guard(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         client = request.client.host if request.client else None
-        status = decide(client, request.method, request.url.path, _api_key(request), networks, hashes)
+        status = decide(client, request.method, request.url.path, _api_key(request), networks, hashes, reconcile)
         if status is not None:
-            error = "unauthorized" if status == 401 else "forbidden: this key may only read memories"
+            error = "unauthorized" if status == 401 else "forbidden: this key may not call this route"
             return JSONResponse({"error": error}, status_code=status)
         return await call_next(request)

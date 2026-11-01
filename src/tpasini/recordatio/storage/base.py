@@ -22,7 +22,7 @@ from tpasini.recordatio.models import (
     RetrievalContext,
     Topic,
 )
-from tpasini.recordatio.retrieval_text import STOPWORDS, lemmatize, normalize_for_index, tokenize
+from tpasini.recordatio.retrieval_text import STOPWORDS, content_words, lemmatize, normalize_for_index, tokenize
 
 # FTS index format version: the index stores pipeline-normalized text, so any
 # change to the §3.1 pipeline (including a simplemma bump — its lemma data is
@@ -1268,6 +1268,192 @@ class SQLiteStore(Store):
             (at.isoformat(), unit_id, agent_id),
         )
         self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Reconcile / compaction support (reconcile/runner.py). The nightly
+    # reconcile physically deletes superseded units; these helpers keep the
+    # cascade in one place so no FTS / embedding / topic / mention / relation
+    # row can outlive the unit it describes.
+    # ------------------------------------------------------------------
+
+    def list_user_ids(self) -> list[str]:
+        """Every user id that owns at least one unit (the scope prefix before
+        ``/``; a legacy bare scope like ``default`` is its own user)."""
+        rows = self._conn.execute("SELECT DISTINCT agent_id FROM knowledge_units").fetchall()
+        return sorted({str(r["agent_id"]).split("/", 1)[0] for r in rows})
+
+    def user_scopes(self, user_id: str) -> list[str]:
+        """The distinct unit scopes (``agent_id`` values) ``user_id`` owns."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT agent_id FROM knowledge_units WHERE agent_id = ? OR agent_id GLOB ? ORDER BY agent_id",
+            (user_id, f"{user_id}/*"),
+        ).fetchall()
+        return [r["agent_id"] for r in rows]
+
+    def scope_units(self, agent_id: str, *, active: bool) -> list[tuple[KnowledgeUnit, int]]:
+        """``(unit, rowid)`` for one scope, oldest row first.
+
+        ``active=True`` → units valid now (``valid_until`` unset or in the
+        future); ``active=False`` → units whose ``valid_until`` has passed.
+        The rowid is the incremental-scan cursor the reconcile job advances.
+        """
+        if active:
+            validity = "(valid_until IS NULL OR valid_until > ?)"
+        else:
+            validity = "(valid_until IS NOT NULL AND valid_until <= ?)"
+        rows = self._conn.execute(
+            f"""
+            SELECT rowid AS rid, id, type, content, asserted_at, valid_from, valid_until, provenance,
+                   extraction_count, retrieval_count
+            FROM knowledge_units
+            WHERE agent_id = ? AND {validity}
+            ORDER BY rowid
+            """,  # noqa: S608 — validity is one of two fixed literals
+            (agent_id, datetime.now().isoformat()),
+        ).fetchall()
+        return [(self._row_to_unit(r), int(r["rid"])) for r in rows]
+
+    def units_by_provenance(self, agent_id: str, provenance: str) -> list[KnowledgeUnit]:
+        """Every unit (active or not) in ``agent_id`` with exactly ``provenance``."""
+        rows = self._conn.execute(
+            """
+            SELECT id, type, content, asserted_at, valid_from, valid_until, provenance,
+                   extraction_count, retrieval_count
+            FROM knowledge_units WHERE agent_id = ? AND provenance = ?
+            ORDER BY asserted_at, rowid
+            """,
+            (agent_id, provenance),
+        ).fetchall()
+        return [self._row_to_unit(r) for r in rows]
+
+    def scope_unit_embeddings(self, agent_id: str, unit_ids: list[str]) -> dict[str, bytes]:
+        """Stored unit embeddings for ``unit_ids`` in exactly one scope."""
+        return self.load_item_embeddings(unit_ids, (agent_id,))
+
+    def fts_unit_neighbours(self, content: str, agent_id: str, limit: int) -> list[str]:
+        """Unit ids in ``agent_id`` whose indexed text best matches ``content``
+        (BM25 over the content words, OR-joined). Empty when FTS is off."""
+        if not self.fts_enabled or limit <= 0:
+            return []
+        words = sorted(content_words(content))
+        if not words:
+            return []
+        expression = " OR ".join(f'"{w}"' for w in words)
+        try:
+            rows = self._conn.execute(
+                f"""
+                SELECT item_id FROM {self._fts_schema}.memento_fts
+                WHERE memento_fts MATCH ? AND agent_id = ? AND kind = 'unit'
+                ORDER BY bm25(memento_fts) ASC, item_id ASC
+                LIMIT ?
+                """,  # noqa: S608 — schema name is a module constant
+                (expression, agent_id, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # malformed MATCH expression — the other signals still run
+        return [r["item_id"] for r in rows]
+
+    def purge_units(self, unit_ids: list[str], agent_id: str) -> dict[str, int]:
+        """PHYSICALLY delete units of one scope and every row that hangs off them.
+
+        Cascade (one transaction across the canonical DB and both sidecars):
+        - ``knowledge_units`` rows (scope-checked: an id outside ``agent_id``
+          is left alone);
+        - their FTS rows and stored embeddings;
+        - ``unit_topics`` tags and ``entity_mentions`` whose source is the unit;
+        - relations with the unit as subject or object (``mentions`` /
+          ``about`` / ``supersedes`` links — they describe the unit, so they
+          go with it) plus those relations' stored embeddings.
+        Entities are never deleted: they are standalone knowledge, and any
+        entity still referenced by another unit or relation stays intact.
+        Returns per-table delete counts for the audit log.
+        """
+        counts = {"units": 0, "fts": 0, "embeddings": 0, "topics": 0, "mentions": 0, "relations": 0}
+        if not unit_ids:
+            return counts
+        marks = ",".join("?" for _ in unit_ids)
+        with self._conn:
+            present = [
+                r["id"]
+                for r in self._conn.execute(
+                    f"SELECT id FROM knowledge_units WHERE agent_id = ? AND id IN ({marks})",  # noqa: S608
+                    (agent_id, *unit_ids),
+                ).fetchall()
+            ]
+            if not present:
+                return counts
+            pm = ",".join("?" for _ in present)
+            relation_ids = [
+                r["id"]
+                for r in self._conn.execute(
+                    f"SELECT id FROM relations WHERE subject_id IN ({pm}) OR object_id IN ({pm})",  # noqa: S608
+                    (*present, *present),
+                ).fetchall()
+            ]
+            counts["units"] = self._conn.execute(
+                f"DELETE FROM knowledge_units WHERE agent_id = ? AND id IN ({pm})",  # noqa: S608
+                (agent_id, *present),
+            ).rowcount
+            counts["topics"] = self._conn.execute(
+                f"DELETE FROM unit_topics WHERE unit_id IN ({pm})",  # noqa: S608
+                tuple(present),
+            ).rowcount
+            counts["mentions"] = self._conn.execute(
+                f"DELETE FROM entity_mentions WHERE source_kind IN ('knowledge_unit', 'unit') "  # noqa: S608
+                f"AND source_id IN ({pm})",
+                tuple(present),
+            ).rowcount
+            if relation_ids:
+                rm = ",".join("?" for _ in relation_ids)
+                counts["relations"] = self._conn.execute(
+                    f"DELETE FROM relations WHERE id IN ({rm})",  # noqa: S608
+                    tuple(relation_ids),
+                ).rowcount
+            embedded = [*present, *relation_ids]
+            em = ",".join("?" for _ in embedded)
+            counts["embeddings"] = self._conn.execute(
+                f"DELETE FROM {self._emb_schema}.item_embeddings WHERE item_id IN ({em})",  # noqa: S608
+                tuple(embedded),
+            ).rowcount
+            if self.fts_enabled:
+                counts["fts"] = self._conn.execute(
+                    f"DELETE FROM {self._fts_schema}.memento_fts WHERE item_id IN ({pm})",  # noqa: S608
+                    tuple(present),
+                ).rowcount
+        return counts
+
+    def vacuum(self) -> None:
+        """Reclaim the space freed by ``purge_units`` in every attached DB.
+
+        Must run outside a transaction. The FTS index is ``optimize``d first
+        so its segment b-trees are merged before the file is rewritten.
+        """
+        self._conn.commit()
+        if self.fts_enabled:
+            self._conn.execute(f"INSERT INTO {self._fts_schema}.memento_fts(memento_fts) VALUES ('optimize')")
+            self._conn.commit()
+            self._conn.execute(f"VACUUM {self._fts_schema}")
+        self._conn.execute(f"VACUUM {self._emb_schema}")
+        self._conn.execute("VACUUM main")
+
+    def backup_to(self, directory: Path) -> list[Path]:
+        """Consistent online snapshot of the canonical DB and its embedding
+        sidecar via the sqlite backup API (never a raw file copy — a copy
+        taken mid-write can be torn). The FTS sidecar is derived data and is
+        rebuilt on open, so it is not snapshotted. Returns the written paths.
+        """
+        directory.mkdir(parents=True, exist_ok=True)
+        self._conn.commit()
+        written: list[Path] = []
+        for schema, name in (("main", self.db_path.name), (self._emb_schema, f"{self.db_path.name}.emb")):
+            target = directory / name
+            dest = sqlite3.connect(str(target))
+            try:
+                self._conn.backup(dest, name=schema)
+            finally:
+                dest.close()
+            written.append(target)
+        return written
 
     def add_entity(self, entity: Entity, agent_id: str, source_agent_id: str | None = None) -> None:
         self._conn.execute(
