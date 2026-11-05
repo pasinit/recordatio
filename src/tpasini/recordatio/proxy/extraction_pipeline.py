@@ -6,6 +6,7 @@ import os
 from collections.abc import Awaitable, Callable, MutableMapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from difflib import SequenceMatcher
 from enum import StrEnum
 from typing import Protocol
 
@@ -483,6 +484,42 @@ _UNIT_NEARDUP_DEFAULT_BY_TYPE: dict[KnowledgeType, float] = {
     KnowledgeType.PROCEDURAL: 0.94,
 }
 
+# ---------------------------------------------------------------------------
+# Flag-independent lexical near-duplicate fallback.
+#
+# The embedding near-dup path above is gated on ``embeddings.enabled()``
+# (RECORDATIO_F2_EMBEDDINGS, default off / "ship dark"), so in a deploy where F2
+# is dark it is a permanent no-op: the ONLY write-side dedup that fires is the
+# exact ``_norm_content`` byte match, which the LLM extractor's paraphrasing
+# almost never satisfies — so every daily re-extraction of a standing fact
+# inserts a fresh unit (extraction_count=1) instead of reinforcing the
+# canonical, and the near-identical clusters the nightly analyst merges by hand
+# accumulate for weeks. This lexical fallback decouples write-side
+# paraphrase-dedup from the retrieval-fusion flag: it runs whenever the
+# embedding path produced no match (F2 dark, model unavailable, or candidates
+# un-embedded), using only the stored unit text — no model, no flag.
+#
+# It is a difflib character-sequence ratio over the normalized ``unit_surface``,
+# deliberately CONSERVATIVE (a wrong merge is irreversible and silent): the
+# cutoffs are high enough that only light paraphrases (whitespace, punctuation,
+# word-order and minor word edits) reinforce, while heavy semantic rewrites fall
+# through and insert — those remain the embedding path's / nightly reconcile's
+# job. It mirrors the cosine knobs' per-type structure (EPISODIC stays at the
+# strict default; the paraphrase-prone durable SEMANTIC/PROCEDURAL types get a
+# slightly looser built-in default) and is fully env-overridable without a
+# rebuild.
+_UNIT_NEARDUP_LEXICAL_DEFAULT = 0.95
+_UNIT_NEARDUP_LEXICAL_GLOBAL_ENV = "RECORDATIO_UNIT_NEARDUP_LEXICAL_RATIO"
+_UNIT_NEARDUP_LEXICAL_ENV_BY_TYPE: dict[KnowledgeType, str] = {
+    KnowledgeType.SEMANTIC: "RECORDATIO_UNIT_NEARDUP_LEXICAL_RATIO_SEMANTIC",
+    KnowledgeType.PROCEDURAL: "RECORDATIO_UNIT_NEARDUP_LEXICAL_RATIO_PROCEDURAL",
+    KnowledgeType.EPISODIC: "RECORDATIO_UNIT_NEARDUP_LEXICAL_RATIO_EPISODIC",
+}
+_UNIT_NEARDUP_LEXICAL_DEFAULT_BY_TYPE: dict[KnowledgeType, float] = {
+    KnowledgeType.SEMANTIC: 0.90,
+    KnowledgeType.PROCEDURAL: 0.90,
+}
+
 
 def _read_cosine_env(name: str, default: float) -> float:
     """Read a cosine cutoff from ``name``, falling back to ``default`` if the var
@@ -573,6 +610,64 @@ def _near_duplicate_unit_id(
         return None
 
 
+def _unit_neardup_lexical_threshold(unit_type: KnowledgeType | None = None) -> float:
+    """Lexical near-duplicate difflib-ratio cutoff, read per call so ops can flip
+    it via env. Resolution mirrors ``_unit_neardup_threshold``, most specific
+    first:
+
+      1. the per-type knob for ``unit_type`` (e.g.
+         ``RECORDATIO_UNIT_NEARDUP_LEXICAL_RATIO_SEMANTIC``), when a type is given;
+      2. the single global knob ``RECORDATIO_UNIT_NEARDUP_LEXICAL_RATIO``;
+      3. the type's built-in default (``_UNIT_NEARDUP_LEXICAL_DEFAULT_BY_TYPE``
+         for the durable SEMANTIC/PROCEDURAL types, else the strict
+         ``_UNIT_NEARDUP_LEXICAL_DEFAULT``).
+    """
+    builtin = _UNIT_NEARDUP_LEXICAL_DEFAULT
+    if unit_type is not None:
+        builtin = _UNIT_NEARDUP_LEXICAL_DEFAULT_BY_TYPE.get(unit_type, _UNIT_NEARDUP_LEXICAL_DEFAULT)
+    global_threshold = _read_cosine_env(_UNIT_NEARDUP_LEXICAL_GLOBAL_ENV, builtin)
+    if unit_type is None:
+        return global_threshold
+    per_type_env = _UNIT_NEARDUP_LEXICAL_ENV_BY_TYPE.get(unit_type)
+    if per_type_env is None:
+        return global_threshold
+    return _read_cosine_env(per_type_env, global_threshold)
+
+
+def _lexical_near_duplicate_unit_id(
+    unit: KnowledgeUnit,
+    candidates: list[tuple[str, str]],
+) -> str | None:
+    """Flag-independent lexical near-duplicate fallback for unit dedup.
+
+    Returns the id of the most-similar active same-type candidate whose difflib
+    ``SequenceMatcher`` ratio over the normalized ``unit_surface`` is at or above
+    ``_unit_neardup_lexical_threshold()``, else ``None``. Uses only the stored
+    unit text — no embedding model and no F2 flag — so write-side paraphrase
+    dedup keeps reinforcing the canonical even when F2 embeddings are dark. The
+    high per-type cutoffs keep it conservative: light paraphrases merge, heavy
+    semantic rewrites fall through to an insert.
+    """
+    if not candidates:
+        return None
+    threshold = _unit_neardup_lexical_threshold(unit.type)
+    incoming = _norm_content(embeddings.unit_surface(unit.content))
+    if not incoming:
+        return None
+    best_id: str | None = None
+    best_ratio = 0.0
+    for candidate_id, content in candidates:
+        other = _norm_content(embeddings.unit_surface(content))
+        if not other:
+            continue
+        ratio = SequenceMatcher(None, incoming, other).ratio()
+        if ratio > best_ratio:
+            best_id, best_ratio = candidate_id, ratio
+    if best_id is not None and best_ratio >= threshold:
+        return best_id
+    return None
+
+
 def _active_unit_id_for_content(
     ctx: ExtractionPipelineContext,
     unit: KnowledgeUnit,
@@ -587,15 +682,23 @@ def _active_unit_id_for_content(
         (agent_id, unit.type.value),
     ).fetchall()
     content_key = _norm_content(unit.content)
-    candidate_ids: list[str] = []
+    candidates: list[tuple[str, str]] = []
     for row in rows:
         if _norm_content(row["content"]) == content_key:
             return row["id"]
-        candidate_ids.append(row["id"])
-    # No byte-for-byte match: fall back to an embedding near-duplicate check so a
-    # paraphrased re-extraction reinforces the canonical instead of inserting a
-    # near-identical twin (no-op unless F2 embeddings are enabled).
-    return _near_duplicate_unit_id(ctx, unit, agent_id, candidate_ids)
+        candidates.append((row["id"], row["content"]))
+    if not candidates:
+        return None
+    # No byte-for-byte match: fall back to a near-duplicate check so a paraphrased
+    # re-extraction reinforces the canonical instead of inserting a near-identical
+    # twin. The embedding-cosine path runs first when F2 is enabled; a
+    # flag-independent lexical fallback then catches light paraphrases whenever the
+    # embedding path produced no match (F2 dark, model unavailable, or candidates
+    # un-embedded), so write-side dedup is no longer dark when F2 is off.
+    embedding_match = _near_duplicate_unit_id(ctx, unit, agent_id, [cid for cid, _ in candidates])
+    if embedding_match is not None:
+        return embedding_match
+    return _lexical_near_duplicate_unit_id(unit, candidates)
 
 
 def _active_attribute_exists(

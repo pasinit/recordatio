@@ -11,6 +11,13 @@ dependency and is never loaded here): ``embeddings.embed_documents`` is
 monkeypatched to embed the incoming content, and the canonical unit's stored
 embedding is written directly via ``store.upsert_item_embedding``. So they
 exercise the dedup control flow without downloading model weights.
+
+A second group of tests covers the flag-independent lexical fallback
+(``_lexical_near_duplicate_unit_id``): the embedding near-dup path is gated on
+``RECORDATIO_F2_EMBEDDINGS`` (default off), so in a deploy where F2 is dark the
+lexical difflib-ratio fallback is what keeps write-side paraphrase dedup from
+going dark. These run with ``embeddings.enabled`` monkeypatched to ``False`` and
+no model loaded at all.
 """
 
 import logging
@@ -114,14 +121,115 @@ def test_distinct_fact_is_not_merged(store: SQLiteStore, monkeypatch: pytest.Mon
     assert _active_unit_id_for_content(ctx, other, _AGENT) is None
 
 
-def test_no_merge_when_embeddings_disabled(store: SQLiteStore, monkeypatch: pytest.MonkeyPatch) -> None:
-    """With F2 off, behaviour is exact-string-only: a paraphrase inserts fresh."""
+def test_lexical_paraphrase_reinforces_when_embeddings_disabled(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The headline regression: with F2 dark (the actual deploy config — the
+    flag is set nowhere), a light paraphrase of a standing durable fact now
+    reinforces the canonical via the flag-independent lexical fallback instead of
+    inserting a near-identical twin.
+
+    Fails on the old code, where ``_near_duplicate_unit_id`` short-circuits to
+    ``None`` whenever ``embeddings.enabled()`` is false, so the only dedup that
+    could fire was the exact ``_norm_content`` byte match — which this
+    punctuation/word-order paraphrase does not satisfy. No embedding model is
+    loaded or monkeypatched here: the lexical path uses stored text only.
+    """
     canonical = _unit("Scout's daily brief lists tracked roles newest first.")
     store.add(canonical, _AGENT)
-    _store_embedding(store, canonical.id, _onehot(0))
     paraphrase = _unit("Scout daily brief: tracked roles, newest first.")
 
     monkeypatch.setattr(embeddings, "enabled", lambda: False)
+
+    ctx = SimpleNamespace(store=store)
+    assert _active_unit_id_for_content(ctx, paraphrase, _AGENT) == canonical.id
+
+
+def test_lexical_fallback_does_not_merge_heavy_rewrite_when_disabled(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lexical fallback is conservative: a heavy semantic rewrite (difflib
+    ratio well under the cutoff) still inserts fresh. Catching those is the
+    embedding path's / nightly reconcile's job — a lexical merge there would risk
+    an irreversible wrong collapse."""
+    canonical = _unit("Scout's daily brief must list each tracked role once, newest first.")
+    store.add(canonical, _AGENT)
+    heavy_rewrite = _unit(
+        "For the Scout daily brief, enter every tracked role a single time, most recent first."
+    )
+
+    monkeypatch.setattr(embeddings, "enabled", lambda: False)
+
+    ctx = SimpleNamespace(store=store)
+    assert _active_unit_id_for_content(ctx, heavy_rewrite, _AGENT) is None
+
+
+def test_lexical_fallback_does_not_merge_distinct_fact_when_disabled(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuinely different fact is nowhere near the cutoff and inserts fresh."""
+    canonical = _unit("Scout's daily brief lists tracked roles newest first.")
+    store.add(canonical, _AGENT)
+    other = _unit("The weekly report should be sent every Friday afternoon.")
+
+    monkeypatch.setattr(embeddings, "enabled", lambda: False)
+
+    ctx = SimpleNamespace(store=store)
+    assert _active_unit_id_for_content(ctx, other, _AGENT) is None
+
+
+def test_lexical_fallback_episodic_stays_conservative_when_disabled(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EPISODIC keeps the strict lexical default (0.95), not the looser durable
+    0.90: a dated status snapshot whose only change is the status word
+    ('submitted' -> 'received') is a DISTINCT event and must not be merged. The
+    same-ratio durable paraphrase in the next test does merge — proving the
+    per-type split is real."""
+    canonical = _unit(
+        "On 2026-09-14 the HRW grants officer application was marked submitted.",
+        unit_type=KnowledgeType.EPISODIC,
+    )
+    store.add(canonical, _AGENT)
+    distinct_status = _unit(
+        "On 2026-09-14 the HRW grants officer application was marked received.",
+        unit_type=KnowledgeType.EPISODIC,
+    )
+
+    monkeypatch.setattr(embeddings, "enabled", lambda: False)
+
+    ctx = SimpleNamespace(store=store)
+    # ratio ~0.92: below the strict episodic default 0.95 → inserts fresh.
+    assert _active_unit_id_for_content(ctx, distinct_status, _AGENT) is None
+
+
+def test_lexical_fallback_durable_merges_in_per_type_band_when_disabled(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durable paraphrase at ratio ~0.94 — between the durable (0.90) and
+    strict/episodic (0.95) cutoffs — merges for SEMANTIC/PROCEDURAL, confirming
+    the looser built-in default is what reinforces the paraphrase-prone types."""
+    canonical = _unit("Scout's daily brief lists tracked roles newest first.")
+    store.add(canonical, _AGENT)
+    paraphrase = _unit("Scout's daily brief shows tracked roles newest first.")
+
+    monkeypatch.setattr(embeddings, "enabled", lambda: False)
+
+    ctx = SimpleNamespace(store=store)
+    assert _active_unit_id_for_content(ctx, paraphrase, _AGENT) == canonical.id
+
+
+def test_lexical_fallback_env_override_when_disabled(
+    store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lexical cutoff is env-overridable without a rebuild: raising the
+    procedural knob above the paraphrase's ratio stops the merge."""
+    canonical = _unit("Scout's daily brief lists tracked roles newest first.")
+    store.add(canonical, _AGENT)
+    paraphrase = _unit("Scout's daily brief shows tracked roles newest first.")  # ratio ~0.94
+
+    monkeypatch.setattr(embeddings, "enabled", lambda: False)
+    monkeypatch.setenv("RECORDATIO_UNIT_NEARDUP_LEXICAL_RATIO_PROCEDURAL", "0.99")
 
     ctx = SimpleNamespace(store=store)
     assert _active_unit_id_for_content(ctx, paraphrase, _AGENT) is None
