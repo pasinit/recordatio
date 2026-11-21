@@ -78,6 +78,22 @@ def test_list_units_for_user_filters_by_day(store: SQLiteStore) -> None:
     assert {u.id for u, _ in pairs} == {"u-new"}
 
 
+def test_list_units_for_user_has_order_backing_index(store: SQLiteStore) -> None:
+    """Regression: list_units_for_user filters by agent_id and does
+    ORDER BY asserted_at DESC. Without an index leading with
+    (agent_id, asserted_at), that read degrades to a full-table scan plus a
+    temp-B-tree sort that blows the client read timeout on large stores
+    (nightly analyst read-path timeout, 2026-11). Guard the composite index."""
+    conn = store._conn
+    found = False
+    for idx in conn.execute("PRAGMA index_list('knowledge_units')").fetchall():
+        cols = [r["name"] for r in conn.execute(f"PRAGMA index_info('{idx['name']}')").fetchall()]
+        if cols[:2] == ["agent_id", "asserted_at"]:
+            found = True
+            break
+    assert found, "expected a composite index leading with (agent_id, asserted_at)"
+
+
 def test_raw_search_respects_as_of(store: SQLiteStore) -> None:
     # The old unit exists...
     assert store.raw_search_units_for_user("sam", "analyst")
