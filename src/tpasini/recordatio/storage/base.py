@@ -981,6 +981,12 @@ class SQLiteStore(Store):
         # the columns are guaranteed to exist on legacy databases.
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_knowledge_units_agent ON knowledge_units(agent_id)",
+            # Composite index backing list_units_for_user's agent_id filter +
+            # ORDER BY asserted_at DESC. Without it, that read degrades to a
+            # full-table scan plus a temp-B-tree sort that blows the client
+            # read timeout on large stores (nightly analyst read-path timeout).
+            "CREATE INDEX IF NOT EXISTS idx_knowledge_units_agent_asserted "
+            "ON knowledge_units(agent_id, asserted_at)",
             "CREATE INDEX IF NOT EXISTS idx_entities_agent ON entities(agent_id)",
             "CREATE INDEX IF NOT EXISTS idx_relations_agent ON relations(agent_id)",
         ]
